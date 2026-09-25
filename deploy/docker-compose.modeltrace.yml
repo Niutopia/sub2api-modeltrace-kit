@@ -1,0 +1,28 @@
+# Add this to your sub2api docker-compose (e.g. as docker-compose.override.yml).
+# Assumes the sub2api service is called "sub2api" and both share one Docker network.
+services:
+  sub2api:
+    # Your own image built from sub2api v0.2.8 + patches/sub2api-v0.2.8-modeltrace.patch
+    image: sub2api:v0.2.8-modeltrace
+    env_file:
+      - ./modeltrace/shared.env
+    environment:
+      MODELTRACE_INTERNAL_URL: http://modeltrace:8081
+      # API key id(s) used by ModelTrace (and channel monitors) — their traffic is not "real usage"
+      MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS: "REPLACE_WITH_PROBE_KEY_ID"
+
+  modeltrace:
+    image: modeltrace-service:local   # docker build -t modeltrace-service:local ./modeltrace
+    restart: unless-stopped
+    env_file:
+      - ./modeltrace/shared.env
+    volumes:
+      - ./modeltrace/config:/run/modeltrace:ro   # config.json lives here
+      - ./modeltrace/data:/data                   # SQLite state
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

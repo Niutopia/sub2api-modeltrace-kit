@@ -1,0 +1,6 @@
+# Human-maintained input constraints. The runtime image installs requirements.lock.txt.
+Flask>=3.0,<4
+httpx>=0.27,<1
+gunicorn>=22,<24
+numpy>=1.26,<3
+psycopg[binary]>=3.2,<4

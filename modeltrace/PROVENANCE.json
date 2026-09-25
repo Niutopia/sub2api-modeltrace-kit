@@ -1,0 +1,27 @@
+{
+  "service": "modeltrace-service",
+  "version": "0.1.13",
+  "upstream": {
+    "repository": "https://github.com/xqy2006/ModelTrace",
+    "commit": "55a2e4a",
+    "license": "MIT"
+  },
+  "copied_unmodified": [
+    {
+      "upstream_path": "fingerprint.py",
+      "service_path": "modeltrace/fingerprint.py",
+      "sha256": "387fe5c44cc5f859995432267b0d3b462fc26e82419fc22e3ee7f36cc2502d98"
+    },
+    {
+      "upstream_path": "data/unified_bank.json",
+      "service_path": "modeltrace/data/unified_bank.json",
+      "sha256": "1c2cb74d372f9f0f30d0dabbb7b7a838660d2f769a88d0c8489e4c662e088c21"
+    },
+    {
+      "upstream_path": "LICENSE",
+      "service_path": "LICENSE",
+      "sha256": "238afb57e498990742f84b9ce6167b4e256ac06104a9938ce953bc41c14bea51"
+    }
+  ],
+  "note": "Everything else in this repository (service, scheduler, transport, API, tests) is written for the sub2api integration and is not part of upstream."
+}

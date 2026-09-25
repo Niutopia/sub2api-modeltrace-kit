@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__
+*.py[cod]
+.pytest_cache
+.venv
+config.json
+/data
+/run
+
+tests
+README.md
+PROVENANCE.json
