@@ -1,88 +1,99 @@
 # sub2api-modeltrace-kit
 
-给 [sub2api](https://github.com/Wei-Shaw/sub2api) **v0.2.8** 加上“模型一致性检测”：定期检查每个 OpenAI 上游号实际跑的是不是它声称的模型，发现降智（例如声称 gpt-5.6-terra，实际回答像别的模型）时自动暂停这个号的这个模型。
+**给 [sub2api](https://github.com/Wei-Shaw/sub2api) v0.2.8 加上“模型一致性检测”：自动发现上游号降智，并只暂停出问题的那个模型。**
+
+上游号声称跑的是 `gpt-5.6-terra`，实际回答却像别的模型？这个补丁包会定期用指纹题目检测每个 OpenAI 上游号，结论直接显示在 sub2api 后台；一旦确认降智，自动把这个号的这个模型停掉，别的模型照常工作，恢复正常后自动解除。
 
 检测算法与题库来自 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace)。
 
-> 检测结果是统计判断，仅供参考；不能作为上游违约的证明。
+---
 
-## 包含什么
+## 功能
 
-| 目录 | 内容 | 许可证 |
-|---|---|---|
-| `patches/sub2api-v0.2.8-modeltrace.patch` | 给 sub2api v0.2.8 打的补丁（60 个文件，后端 + 前端） | LGPL-3.0（同 sub2api，见 `patches/LICENSE`） |
-| `modeltrace/` | 检测服务（Python，独立容器） | MIT（见 `modeltrace/LICENSE`） |
-| `deploy/` | docker compose、密钥、nginx 示例 | — |
+- **按账号检测**：每个 OpenAI 号（OAuth 与 API Key）都会被检测，新号自动加入。
+- **动态频率**：最近 10 分钟有人用的号每 5 分钟测一次；没人用的号每小时一次，并在一小时内错开，不会同时打满上游。
+- **真实路径**：检测请求经过 sub2api 自己的网关，并被钉在指定的号上（不换号、不故障转移），测的就是用户实际走的那条路。
+- **自动暂停**：确认降智后只暂停**这个号的这个模型**，其他模型照常调度；恢复一致后自动解除，也可以手动解除。
+- **后台可见**：
+  - 账号管理页：每个 OpenAI 号的“状态”列下方显示检测标签，点开能看每个模型的结论、最像哪个模型、判定说明和最近 12 次记录，还能选模型立即检测、立即复测、重置状态。
+  - 渠道状态页：监控卡片右上角显示“一致性”标签。
 
-## 装好以后能看到
+## 怎么判定
 
-- **账号管理页**：每个 OpenAI 号的“状态”列下面多一个检测标签（一致 / 可疑 / 不确定 / 检测失败）。点开是弹窗：每个模型一行，显示最新结论、最相似的模型、判定说明、最近 12 次记录；可以选模型“立即检测”；被暂停的模型有“立即复测”“重置状态”。
-- **渠道状态页**：监控卡片右上角多一个“一致性”标签（需要在检测服务配置里把监控项和模型对应起来，见下文）。
+一次检测在同一个任务里连续出题，直到得出结论：
 
-## 检测规则
+| 这一题的结果 | 怎么处理 |
+|---|---|
+| 与声称的模型一致 | 判 **一致**，结束 |
+| 明显像别的模型（另一模型概率 ≥ 70%，声称的模型 ≤ 15%） | 记 1 次“不对”；攒够 **3 次** → 判 **可疑（降智）** |
+| 说不准 | 不计数，换一题 |
+| 没测成（上游报错、回答不完整） | 不计数，换一题 |
 
-- 每个 OpenAI 号（OAuth 与 API Key）都会被检测。最近 10 分钟有真实请求的号每 5 分钟测一次，其余每小时一次、在一小时内错开。
-- 一次检测在同一个任务里连续出题：
-  - 这题一致 → 判“一致”，结束；
-  - 这题**明显像别的模型**（另一模型概率 ≥ 70%、目标模型 ≤ 15%）→ 记 1 次不对，攒够 **3 次** → 判“可疑”（降智）；
-  - “说不准”或没测成（上游报错、回答太短）→ 不计数，换一题；
-  - 一次最多发 5 次请求；到上限还没结论：有测成的题 → “不确定”，一题没测成 → “检测失败”。
-- **自动暂停**：判“可疑”后，只暂停**这个号的这个模型**（复用 sub2api 原有的“模型级限流”，账号列表会显示“模型 X 限流至 …”），其他模型照常调度。OAuth 号停 24 小时，API Key 号停 60 分钟；暂停期间照常检测，恢复一致立即解除。人工也可以点“重置状态”解除。只会解除检测器自己加的暂停，不影响真实的 429 限流。
-- 检测请求通过 sub2api 自己的网关发出，并用内部密钥把请求钉在指定的号上（不换号、不故障转移），所以测的就是用户真实走的路径。
+一次检测最多发 5 次请求。到上限还没结论：有测成的题判 **不确定**，一题都没测成判 **检测失败**。正常的号第 1 题就会判一致，只花 1 次请求。
 
-## 安装
+**自动暂停**只在判“可疑”时触发：OAuth 号暂停 24 小时，API Key 号暂停 60 分钟。暂停期间照常检测，一旦恢复一致立即解除。它复用 sub2api 原有的“模型级限流”，账号列表会显示“模型 X 限流至 …”；只会解除检测器自己加的暂停，不会碰上游真实的 429 限流。
 
-前提：你能自己从源码构建 sub2api 镜像（补丁需要重新编译）。
+> 检测是统计判断，结果仅供参考，不能作为上游违约的证明。
 
-### 1. 给 sub2api 打补丁并构建
+## 快速开始
+
+**前提**：能从源码构建 sub2api 镜像（补丁需要重新编译 sub2api），用 Docker Compose 部署。
+
+### 1. 打补丁并构建 sub2api
 
 ```bash
 git clone https://github.com/Wei-Shaw/sub2api.git
 cd sub2api
 git checkout v0.2.8
 git apply /path/to/sub2api-modeltrace-kit/patches/sub2api-v0.2.8-modeltrace.patch
-# 然后按 sub2api 官方文档构建你的镜像，例如：
 docker build -t sub2api:v0.2.8-modeltrace .
 ```
 
-补丁只针对 v0.2.8；其他版本请先在测试环境试 `git apply --check`。
+补丁针对 v0.2.8 制作并验证过。其他版本请先运行 `git apply --check` 看能否打上。
 
-### 2. 构建检测服务镜像
+### 2. 构建检测服务
 
 ```bash
-docker build -t modeltrace-service:local ./modeltrace
+docker build -t modeltrace-service:local /path/to/sub2api-modeltrace-kit/modeltrace
 ```
 
-`modeltrace/Dockerfile` 的基础镜像按摘要锁定为 linux/amd64；ARM 服务器请把第一行改成 `FROM python:3.12-slim`。
+`Dockerfile` 的基础镜像锁定为 linux/amd64。ARM 服务器请把第一行改成 `FROM python:3.12-slim`。
 
 ### 3. 准备配置
 
-在 sub2api 的部署目录下：
+在 sub2api 的部署目录下新建：
 
 ```text
 modeltrace/
-├── shared.env          # 从 deploy/shared.env.example 复制，填一个长随机密钥
-├── config/config.json  # 从 modeltrace/config.example.json 复制并修改
-└── data/               # 空目录，检测服务的 SQLite 数据（容器内用户 uid 10001 需要可写）
+├── shared.env          # 复制 deploy/shared.env.example，填一个长随机密钥
+├── config/config.json  # 复制 modeltrace/config.example.json 后修改
+└── data/               # 空目录，存检测记录（容器内 uid 10001 需要可写）
 ```
 
-`config.json` 里要改的：
+`config.json` 需要改的只有两处：
 
-- `api_key`：在 sub2api 后台为检测**单独建一个 API Key**（绑定到能用到这些 OpenAI 号的分组）。
-- `base_url`：保持 `http://sub2api:8080/v1`（检测请求只走 Docker 内网）。
-- `host_api_base`：保持 `http://sub2api:8080`。
-- `monitors`：渠道状态页的标签用。键是 sub2api 里渠道监控项的 ID，值写这个监控项的模型，例如 `"2": {"model": "gpt-6-astra", "enabled": false, "supported": true}`。不需要渠道页标签可以留空对象。
+- `api_key`：在 sub2api 后台为检测**单独新建一个 API Key**，所在分组要能用到你想检测的 OpenAI 号。
+- `monitors`：想在渠道状态页显示“一致性”标签时填写。键是渠道监控项的 ID，值写它对应的模型，例如：
+  ```json
+  "monitors": { "2": { "model": "gpt-6-astra", "enabled": false, "supported": true } }
+  ```
+  不需要可以写 `{}`。
 
-### 4. 加到 docker compose
+其余保持默认即可（`base_url` 与 `host_api_base` 默认走 Docker 内网 `http://sub2api:8080`）。
 
-参考 `deploy/docker-compose.modeltrace.yml`：
+### 4. 加入 Docker Compose
 
-- sub2api 加环境变量 `MODELTRACE_INTERNAL_URL=http://modeltrace:8081`、`MODELTRACE_SECRET`（来自 shared.env），以及 `MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS=<第 3 步那个 Key 的 ID>`（检测自己的流量不算“有人在用”；如果渠道监控也用了某个 Key，一并写上，逗号分隔）。
-- 检测服务的 compose 服务名必须是 `modeltrace`（或 `sub2api-modeltrace`），端口 8081——sub2api 只允许连这两个名字，防止密钥被发到别处。
+参考 [`deploy/docker-compose.modeltrace.yml`](deploy/docker-compose.modeltrace.yml)，要点：
 
-### 5. 反向代理屏蔽内部接口
+- sub2api 使用第 1 步构建的镜像，并加上环境变量：
+  - `MODELTRACE_INTERNAL_URL=http://modeltrace:8081`
+  - `MODELTRACE_SECRET`（从 `shared.env` 读取）
+  - `MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS=<第 3 步那个 Key 的 ID>`：检测自己的请求不算“有人在用”。渠道监控用的 Key 也写上，多个用逗号分隔。
+- 检测服务的服务名必须是 `modeltrace`（或 `sub2api-modeltrace`），端口 8081。sub2api 只会连这两个名字，防止密钥被发到别处。
 
-`/api/v1/internal/*` 只给 Docker 内网用，公网必须挡掉，见 `deploy/nginx-snippet.conf`。
+### 5. 挡住内部接口
+
+`/api/v1/internal/*` 只给 Docker 内网使用。在反向代理里对公网屏蔽，Nginx 写法见 [`deploy/nginx-snippet.conf`](deploy/nginx-snippet.conf)。
 
 ### 6. 启动并确认
 
@@ -91,22 +102,51 @@ docker compose up -d
 docker compose exec modeltrace python -c "import os,httpx;print(httpx.get('http://127.0.0.1:8081/health',headers={'Authorization':'Bearer '+os.environ['MODELTRACE_SECRET']}).json())"
 ```
 
-看到 `"worker_running": true` 即可。几分钟后账号管理页的 OpenAI 号会出现检测标签。
+看到 `"worker_running": true` 就成功了。几分钟后，账号管理页的 OpenAI 号下方会出现检测标签。
 
-## 可调配置（`config.json`，都可省略）
+## 配置参考
 
-| 字段 | 默认 | 说明 |
+`config.json` 里的可选项：
+
+| 字段 | 默认值 | 作用 |
 |---|---|---|
 | `per_account_enabled` | `true` | 按账号检测 |
-| `active_interval_seconds` / `idle_interval_seconds` / `active_window_seconds` | 300 / 3600 / 600 | 活跃/空闲检测间隔、判定活跃的时间窗 |
+| `active_interval_seconds` | `300` | 有人在用的号多久测一次（秒） |
+| `idle_interval_seconds` | `3600` | 没人用的号多久测一次（秒） |
+| `active_window_seconds` | `600` | 多久内有真实请求算“有人在用”（秒） |
 | `auto_pause_enabled` | `true` | 判“可疑”后自动暂停 |
-| `pause_minutes_oauth` / `pause_minutes_apikey` | 1440 / 60 | 暂停时长 |
-| `paused_recheck_seconds_apikey` | 1800 | API Key 号暂停期间多久复查一次 |
-| `idle_timeout_seconds` | 600 | 连续多少秒没有任何输出才判超时（没有总时长上限） |
+| `pause_minutes_oauth` | `1440` | OAuth 号暂停多久（分钟） |
+| `pause_minutes_apikey` | `60` | API Key 号暂停多久（分钟） |
+| `paused_recheck_seconds_apikey` | `1800` | API Key 号暂停期间多久复查一次（秒） |
+| `idle_timeout_seconds` | `600` | 连续多少秒没有任何输出才算超时（没有总时长上限） |
 
-## 致谢
+## 常见问题
 
-- **sub2api** — 作者 [Wei-Shaw](https://github.com/Wei-Shaw)，本补丁基于其 v0.2.8 源码，遵循 LGPL-3.0。
-- **ModelTrace** — 作者 [xqy2006](https://github.com/xqy2006)，指纹算法与题库原样取自 commit `55a2e4a`（MIT），见 `modeltrace/PROVENANCE.json`。
+**会消耗很多额度吗？**
+正常的号每次检测只发 1 个请求。只有结果可疑的号才会多测几题，一次最多 5 个请求。
 
-详细的许可证说明见 `NOTICE.md`。
+**会把整个号停掉吗？**
+不会。只暂停被判降智的那一个模型，号本身和其他模型不受影响。
+
+**误判了怎么办？**
+在账号管理页点开检测标签，对被暂停的模型点“重置状态”，立即解除。想完全关掉自动暂停，把 `auto_pause_enabled` 设为 `false`，只看结果不停号。
+
+**支持 OpenAI 以外的平台吗？**
+不支持。检测题库和判定目前只覆盖 OpenAI 模型。
+
+## 目录结构
+
+```text
+patches/sub2api-v0.2.8-modeltrace.patch   sub2api v0.2.8 补丁（后端 + 前端）
+modeltrace/                               检测服务源码、Dockerfile、示例配置、测试
+deploy/                                   Compose、密钥、Nginx 示例
+```
+
+## 说明与致谢
+
+这是个人二次开发的项目，基于以下两个开源项目：
+
+- **[sub2api](https://github.com/Wei-Shaw/sub2api)**，作者 [Wei-Shaw](https://github.com/Wei-Shaw)。`patches/` 中的补丁修改自 sub2api v0.2.8。
+- **[ModelTrace](https://github.com/xqy2006/ModelTrace)**，作者 [xqy2006](https://github.com/xqy2006)。`modeltrace/` 中的指纹算法（`modeltrace/fingerprint.py`）与题库（`modeltrace/data/unified_bank.json`）原样取自上游 commit `55a2e4a`，文件哈希见 [`modeltrace/PROVENANCE.json`](modeltrace/PROVENANCE.json)。
+
+两个原项目的许可证文件按其要求保留在对应目录：[`patches/LICENSE`](patches/LICENSE)、[`modeltrace/LICENSE`](modeltrace/LICENSE)。
