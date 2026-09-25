@@ -247,7 +247,7 @@ class ModelTraceDB:
                 ).fetchone()
                 return False, int(existing["id"]) if existing else None
 
-    def claim_next_account(self, *, now: float) -> AccountQueueItem | None:
+    def claim_next_account(self, *, now: float, allow_scheduled: bool = True) -> AccountQueueItem | None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -261,10 +261,11 @@ class ModelTraceDB:
                     """
                     SELECT * FROM account_queue
                     WHERE state = 'queued' AND available_at <= ?
+                      AND (? OR trigger = 'manual')
                     ORDER BY available_at ASC, id ASC
                     LIMIT 1
                     """,
-                    (now,),
+                    (now, int(allow_scheduled)),
                 ).fetchone()
                 if row is None:
                     self._conn.execute("COMMIT")
@@ -895,7 +896,7 @@ class ModelTraceDB:
                 raise
         return created
 
-    def claim_next(self, *, now: float) -> QueueItem | None:
+    def claim_next(self, *, now: float, allow_scheduled: bool = True) -> QueueItem | None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -907,10 +908,11 @@ class ModelTraceDB:
                     """
                     SELECT * FROM queue
                     WHERE state = 'queued' AND available_at <= ?
+                      AND (? OR trigger = 'manual')
                     ORDER BY available_at, id
                     LIMIT 1
                     """,
-                    (now,),
+                    (now, int(allow_scheduled)),
                 ).fetchone()
                 if row is None:
                     self._conn.execute("COMMIT")

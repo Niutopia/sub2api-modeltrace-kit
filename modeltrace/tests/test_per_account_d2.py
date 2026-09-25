@@ -79,7 +79,7 @@ def make_service(tmp_path, fake_clock, host_client=None, transport=None, config_
     config_dict = {
         "base_url": "https://api.example.com/v1",
         "api_key": "test-key-not-used-by-fake",
-        "enabled": False,
+        "enabled": True,
         "interval_seconds": 3600,
         "daily_budget_usd": 5,
         "max_output_tokens": 2048,
@@ -113,7 +113,7 @@ def make_service(tmp_path, fake_clock, host_client=None, transport=None, config_
 
 
 def test_version_is_0113():
-    assert __version__ == "0.1.15"
+    assert __version__ == "0.1.16"
 
 
 def test_account_unavailable_in_safe_message_codes():

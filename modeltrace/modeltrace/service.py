@@ -18,7 +18,7 @@ from typing import Any, Callable
 import httpx
 
 from . import __version__
-from .config import MonitorConfig, ServiceConfig
+from .config import ConfigError, MonitorConfig, ServiceConfig
 from .db import ModelTraceDB, QueueItem
 from .fingerprint import analyze_outputs, generate_challenges, load_bank, parse_numbers
 from .transport import ProbeResult, ProbeTransport
@@ -251,6 +251,9 @@ class ModelTraceService:
         self.bank_path = Path(bank_path or Path(__file__).with_name("data") / "unified_bank.json")
         self.bank = load_bank(self.bank_path)
         self.bank_models = {str(model["id"]): model for model in self.bank.get("models", [])}
+        if any(alias in self.bank_models or canonical not in self.bank_models
+               for alias, canonical in config.model_aliases.items()):
+            raise ConfigError("model_aliases must point directly to a known bank model and not shadow one")
         self.transport = transport or ProbeTransport(
             endpoint=config.endpoint,
             api_key=config.api_key,
@@ -260,6 +263,7 @@ class ModelTraceService:
             max_prompt_bytes=config.max_prompt_bytes,
             probe_secret=os.environ.get("MODELTRACE_SECRET"),
             reasoning_effort_overrides=config.reasoning_effort_overrides,
+            model_aliases=config.model_aliases,
             idle_timeout_seconds=getattr(config, "idle_timeout_seconds", None),
             total_timeout_seconds=getattr(config, "total_timeout_seconds", None),
         )
@@ -337,7 +341,7 @@ class ModelTraceService:
             self.db.set_initial_next_run(monitor_id, next_run, now=now)
 
     def is_supported(self, monitor: MonitorConfig) -> bool:
-        return monitor.configured_supported and monitor.model in self.bank_models
+        return monitor.configured_supported and self.config.calibration_model_for(monitor.model) in self.bank_models
 
     def support_message_code(self, monitor: MonitorConfig) -> str:
         return "ok" if self.is_supported(monitor) else "unsupported_model"
@@ -413,17 +417,17 @@ class ModelTraceService:
                 self._schedule_due_accounts(now)
                 # Monitors are no longer scheduled here, but a manual run from the
                 # channel page still lands in the monitor queue and must be served.
-                job = self.db.claim_next(now=now)
+                job = self.db.claim_next(now=now, allow_scheduled=self.config.enabled)
                 if job is not None:
                     self._run_job_safely(job)
                     continue
-                acct_job = self.db.claim_next_account(now=now)
+                acct_job = self.db.claim_next_account(now=now, allow_scheduled=self.config.enabled)
                 if acct_job is not None:
                     self._run_account_job_safely(acct_job)
                     continue
             else:
                 self._schedule_due(now)
-                job = self.db.claim_next(now=now)
+                job = self.db.claim_next(now=now, allow_scheduled=self.config.enabled)
                 if job is not None:
                     self._run_job_safely(job)
                     continue
@@ -670,13 +674,13 @@ class ModelTraceService:
             for item in normalized_results[:3]
         ]
         target_prob_item = next(
-            (item["probability"] for item in normalized_results if item["model"] == monitor.model),
+            (item["probability"] for item in normalized_results if item["model"] == self.config.calibration_model_for(monitor.model)),
             None,
         )
         target_probability = _clamp_probability(target_prob_item)
 
         previous_samples = self._retest_states.get(monitor.monitor_id, {}).get("previous_samples", [])
-        sample_class = classify_sample(analysis, monitor.model, previous=previous_samples)
+        sample_class = classify_sample(analysis, self.config.calibration_model_for(monitor.model), previous=previous_samples)
         outcome = sample_class["outcome"]
 
         # Check if currently in retest state
@@ -874,9 +878,8 @@ class ModelTraceService:
             "protocol": PROTOCOL,
             "reasoning_effort": self.config.reasoning_effort_for(monitor.model),
             "calibration_reference_effort": "none",
-            "calibration_compatibility": (
-                "verified" if self.config.reasoning_effort_for(monitor.model) == "none" else "unverified"
-            ),
+            "calibration_compatibility": "unverified",
+            "calibration_model": self.config.calibration_model_for(monitor.model),
             "service_tier": SERVICE_TIER,
             "enabled": bool(monitor.enabled),
             "supported": self.is_supported(monitor),
@@ -1190,7 +1193,7 @@ class ModelTraceService:
         best_model: str | None,
         now: float,
     ) -> None:
-        if not getattr(self.config, "auto_pause_enabled", True):
+        if not self.config.enabled or not self.config.auto_pause_enabled:
             return
         if not self.host_client:
             return
@@ -1204,7 +1207,12 @@ class ModelTraceService:
             if model in m_models:
                 supporting_members.append(m)
         if not supporting_members:
-            supporting_members = members
+            return
+        # A cluster result must not change any member using unverified evidence.
+        # Explicit account/route/effort calibration is required for EVERY member.
+        if not all(self.config.auto_actions_calibrated(int(m["account_id"]), model)
+                   for m in supporting_members):
+            return
 
         if status == "suspect":
             evidence = f"{message_code} {best_model}" if best_model else message_code
@@ -1246,10 +1254,12 @@ class ModelTraceService:
                 for m in supporting_members:
                     acct_id = int(m["account_id"])
                     try:
-                        self.host_client.resume_model(acct_id, model)
+                        resumed = bool(self.host_client.resume_model(acct_id, model))
                     except Exception as exc:
+                        resumed = False
                         logger.warning("resume_model call failed for account %s: %s", acct_id, type(exc).__name__)
-                    self._update_member_paused_model(acct_id, model, None)
+                    if resumed:
+                        self._update_member_paused_model(acct_id, model, None)
 
     def _compute_target_next_model(self, target: dict[str, Any]) -> str | None:
         models = target.get("models", [])
@@ -1325,7 +1335,7 @@ class ModelTraceService:
         self._last_account_refresh_at = now
         if not self.host_client:
             return
-        all_models = sorted(self.bank_models.keys())
+        all_models = sorted(set(self.bank_models) | set(self.config.model_aliases))
         res = self.host_client.fetch_accounts(all_models)
         if isinstance(res, tuple):
             account_list, fetch_ok = res
@@ -1359,7 +1369,7 @@ class ModelTraceService:
                 rms = acc.get("real_models_10m", [])
                 if rms:
                     for rm in rms:
-                        if rm in self.bank_models:
+                        if self.config.calibration_model_for(rm) in self.bank_models:
                             cluster_reals.setdefault(cid, [])
                             if rm not in cluster_reals[cid]:
                                 cluster_reals[cid].append(rm)
@@ -1375,7 +1385,7 @@ class ModelTraceService:
             type_ = acc.get("type")
             schedulable = bool(acc.get("schedulable", True))
             raw_models = acc.get("models", [])
-            valid_models = [m for m in raw_models if m in self.bank_models]
+            valid_models = [m for m in raw_models if self.config.calibration_model_for(m) in self.bank_models]
             last_real_str = acc.get("last_real_request_at")
             last_real_ts = None
             if last_real_str:
@@ -1394,7 +1404,7 @@ class ModelTraceService:
             else:
                 is_active = (last_real_ts is not None and (now - last_real_ts <= self.config.active_window_seconds))
                 rms = acc.get("real_models_10m", [])
-                real_models = [m for m in rms if m in self.bank_models] if rms else []
+                real_models = [m for m in rms if self.config.calibration_model_for(m) in self.bank_models] if rms else []
 
             paused_models = acc.get("paused_models", [])
             if not isinstance(paused_models, list):
@@ -1528,6 +1538,8 @@ class ModelTraceService:
                     self.db.set_account_next_run(int(non_rep["account_id"]), None, now=now)
 
     def _schedule_due_accounts(self, now: float) -> None:
+        if not self.config.enabled or not self.config.per_account_enabled:
+            return
         targets = self._get_all_targets()
         for target in targets:
             rep_id = target["rep_account_id"]
@@ -1755,12 +1767,12 @@ class ModelTraceService:
                     for item in normalized_results[:3]
                 ]
                 target_prob_item = next(
-                    (item["probability"] for item in normalized_results if item["model"] == model),
+                    (item["probability"] for item in normalized_results if item["model"] == self.config.calibration_model_for(model)),
                     None,
                 )
                 target_prob = _clamp_probability(target_prob_item)
 
-                sample_class = classify_sample(analysis, model, previous=previous_samples)
+                sample_class = classify_sample(analysis, self.config.calibration_model_for(model), previous=previous_samples)
                 outcome = sample_class["outcome"]
                 previous_samples.append({"prediction": pred_model, "outcome": outcome})
 
@@ -1888,6 +1900,7 @@ class ModelTraceService:
         now = self.clock()
         rep_id = target["rep_account_id"]
         resumed = 0
+        failed_accounts = []
         for m in members:
             try:
                 m_models = json.loads(m["models_json"])
@@ -1896,12 +1909,19 @@ class ModelTraceService:
             if model not in m_models:
                 continue
             acct_id = int(m["account_id"])
+            confirmed = False
             if self.host_client is not None:
                 try:
-                    resumed += int(bool(self.host_client.resume_model(acct_id, model)))
+                    confirmed = bool(self.host_client.resume_model(acct_id, model))
                 except Exception as exc:
                     logger.warning("resume_model call failed for account %s: %s", acct_id, type(exc).__name__)
-            self._update_member_paused_model(acct_id, model, None)
+            if confirmed:
+                resumed += 1
+                self._update_member_paused_model(acct_id, model, None)
+            else:
+                failed_accounts.append(acct_id)
+        if failed_accounts:
+            return {"reset": False, "resumed": resumed, "failed_account_ids": failed_accounts}
         self.db.insert_account_round(
             account_id=rep_id, model=model, status="reset", message_code="manual_reset",
             checked_at=now, diagnostics={"manual_reset": True},
@@ -1988,6 +2008,10 @@ class ModelTraceService:
             paused_until = self._get_model_paused_until(members, mod, now)
             per_model.append({
                 "model": mod,
+                "calibration_model": self.config.calibration_model_for(mod),
+                "auto_actions_eligible": bool(self.config.enabled and self.config.auto_pause_enabled
+                    and all(self.config.auto_actions_calibrated(int(m["account_id"]), mod)
+                            for m in members if mod in json.loads(m["models_json"]))),
                 "latest": mod_latest,
                 "history": mod_history,
                 "paused_until": paused_until,

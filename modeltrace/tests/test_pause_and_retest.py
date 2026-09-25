@@ -209,7 +209,11 @@ def test_three_difference_signals_suspect_repeated_other_model_and_pauses(tmp_pa
     ])
 
     transport = MockProbeTransport()
-    svc = make_service(tmp_path, fake_clock, host_client=host, transport=transport)
+    svc = make_service(tmp_path, fake_clock, host_client=host, transport=transport,
+        config_overrides={"auto_pause_calibrations": [
+            {"account_id": a["account_id"], "model": "gpt-5.6-sol",
+             "reasoning_effort": "none", "reference": "mock-calibration-fixture"}
+            for a in host.accounts_data]})
     monkeypatch.setattr("modeltrace.service.analyze_outputs", lambda *a, **k: {
         "prediction": "gpt-5.6-luna",
         "results": [
@@ -523,7 +527,11 @@ def test_suspect_pauses_apikey_account_with_60_minutes(tmp_path, fake_clock, mon
     ])
 
     transport = MockProbeTransport()
-    svc = make_service(tmp_path, fake_clock, host_client=host, transport=transport)
+    svc = make_service(tmp_path, fake_clock, host_client=host, transport=transport,
+        config_overrides={"auto_pause_calibrations": [
+            {"account_id": a["account_id"], "model": "gpt-5.6-sol",
+             "reasoning_effort": "none", "reference": "mock-calibration-fixture"}
+            for a in host.accounts_data]})
     monkeypatch.setattr("modeltrace.service.analyze_outputs", lambda *a, **k: {
         "prediction": "gpt-5.6-luna",
         "results": [

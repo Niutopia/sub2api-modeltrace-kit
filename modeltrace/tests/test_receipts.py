@@ -115,7 +115,7 @@ def test_public_snapshot_and_persisted_rounds_exclude_secrets_and_raw_output(tmp
     public = service.snapshot(1)
     assert set(public) == {
         "monitor_id", "model", "scope_label", "protocol", "reasoning_effort",
-        "calibration_reference_effort", "calibration_compatibility", "service_tier",
+        "calibration_reference_effort", "calibration_compatibility", "calibration_model", "service_tier",
         "enabled", "supported", "running", "interval_seconds", "last_checked_at", "next_run_at",
         "stale", "latest", "history", "paused_budget", "next_run_after", "paused_reconciliation",
         "retest_progress", "accounts_summary",

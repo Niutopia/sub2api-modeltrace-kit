@@ -94,8 +94,23 @@ class ServiceConfig:
     pause_minutes_apikey: int = 60
     paused_recheck_seconds_apikey: int = 1800
 
+    # No account is automatically treated as calibrated, including native none.
+    auto_pause_calibrations: tuple[dict[str, Any], ...] = ()
+    model_aliases: dict[str, str] = field(default_factory=dict)
+
+    def calibration_model_for(self, model: str) -> str:
+        return self.model_aliases.get(model, model)
+
     def reasoning_effort_for(self, model: str) -> str:
-        return self.reasoning_effort_overrides.get(model, DEFAULT_REASONING_EFFORTS.get(model, "none"))
+        canonical = self.calibration_model_for(model)
+        return self.reasoning_effort_overrides.get(model, self.reasoning_effort_overrides.get(
+            canonical, DEFAULT_REASONING_EFFORTS.get(canonical, "none")))
+
+    def auto_actions_calibrated(self, account_id: int, model: str) -> bool:
+        return any(c["account_id"] == account_id and c["model"] == model
+                   and c["reasoning_effort"] == self.reasoning_effort_for(model)
+                   for c in self.auto_pause_calibrations)
+
 
     def price_for(self, model: str) -> Pricing | None:
         return self.pricing_upper_bound.get(model)
@@ -316,6 +331,32 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
     active_window_seconds = _as_int(raw.get("active_window_seconds", 600), field="active_window_seconds", minimum=1)
     per_account_enabled = _as_bool(raw.get("per_account_enabled"), field="per_account_enabled", default=True)
     auto_pause_enabled = _as_bool(raw.get("auto_pause_enabled"), field="auto_pause_enabled", default=True)
+    model_aliases = raw.get("model_aliases", {})
+    if not isinstance(model_aliases, dict) or any(
+        not isinstance(k, str) or not k.strip() or k != k.strip()
+        or not isinstance(v, str) or not v.strip() or v != v.strip()
+        or k == v or v in model_aliases for k, v in model_aliases.items()
+    ):
+        raise ConfigError("model_aliases must map route names directly to distinct bank model IDs")
+    calibrations = raw.get("auto_pause_calibrations", [])
+    if not isinstance(calibrations, list):
+        raise ConfigError("auto_pause_calibrations must be a list")
+    seen_calibrations = set()
+    for c in calibrations:
+        if not isinstance(c, dict) or set(c) != {"account_id", "model", "reasoning_effort", "reference"}:
+            raise ConfigError("each auto_pause_calibrations item requires account_id, model, reasoning_effort, reference")
+        if type(c["account_id"]) is not int or c["account_id"] <= 0:
+            raise ConfigError("calibration account_id must be a positive integer")
+        if not isinstance(c["model"], str) or not c["model"].strip():
+            raise ConfigError("calibration model must be non-empty")
+        if not isinstance(c["reasoning_effort"], str) or c["reasoning_effort"] not in VALID_REASONING_EFFORTS:
+            raise ConfigError("calibration reasoning_effort is invalid")
+        if not isinstance(c["reference"], str) or not 1 <= len(c["reference"].strip()) <= 256:
+            raise ConfigError("calibration reference must identify documented route-specific validation")
+        key = (c["account_id"], c["model"], c["reasoning_effort"])
+        if key in seen_calibrations:
+            raise ConfigError("duplicate auto-action calibration")
+        seen_calibrations.add(key)
     pause_minutes_oauth = _as_int(raw.get("pause_minutes_oauth", 1440), field="pause_minutes_oauth", minimum=1)
     pause_minutes_apikey = _as_int(raw.get("pause_minutes_apikey", 60), field="pause_minutes_apikey", minimum=1)
     paused_recheck_seconds_apikey = _as_int(
@@ -375,6 +416,8 @@ def load_config(path: str | Path | None = None) -> ServiceConfig:
         active_window_seconds=active_window_seconds,
         per_account_enabled=per_account_enabled,
         auto_pause_enabled=auto_pause_enabled,
+        auto_pause_calibrations=tuple(dict(c) for c in calibrations),
+        model_aliases=dict(model_aliases),
         pause_minutes_oauth=pause_minutes_oauth,
         pause_minutes_apikey=pause_minutes_apikey,
         paused_recheck_seconds_apikey=paused_recheck_seconds_apikey,

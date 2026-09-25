@@ -18,7 +18,7 @@ from tests.test_per_account_d2 import MockHostClient, MockProbeTransport, make_s
 
 
 def test_version_remains_0113():
-    assert __version__ == "0.1.15"
+    assert __version__ == "0.1.16"
 
 
 def test_cluster_three_members_scheduled_once_per_hour_with_cluster_hash(tmp_path, fake_clock):

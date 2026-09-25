@@ -1,8 +1,8 @@
 # sub2api-modeltrace-kit
 
-**给 [sub2api](https://github.com/Wei-Shaw/sub2api) v0.2.8 加上“模型一致性检测”：自动发现上游号降智，并只暂停出问题的那个模型。**
+**给 [sub2api](https://github.com/Wei-Shaw/sub2api) v0.2.8 加上“模型一致性检测”：观察上游模型指纹一致性，显式完成线路校准后才允许自动暂停。**
 
-上游号声称跑的是 `gpt-5.6-terra`，实际回答却像别的模型？这个补丁包会定期用指纹题目检测每个 OpenAI 上游号，结论直接显示在 sub2api 后台；一旦确认降智，自动把这个号的这个模型停掉，别的模型照常工作，恢复正常后自动解除。
+上游号声称跑的是 `gpt-5.6-terra`，实际回答却像别的模型？这个补丁包会定期用指纹题目检测每个 OpenAI 上游号，结论直接显示在 sub2api 后台；只有配置了该账号/路由/推理参数的校准记录且命中暂停规则时，才自动把这个号的这个模型停掉，别的模型照常工作，恢复正常后自动解除。
 
 检测算法与题库来自 [xqy2006/ModelTrace](https://github.com/xqy2006/ModelTrace)。
 
@@ -31,7 +31,7 @@
 
 一次检测最多发 5 次请求。到上限还没结论：有测成的题判 **不确定**，一题都没测成判 **检测失败**。正常的号第 1 题就会判一致，只花 1 次请求。
 
-**自动暂停**只在判“可疑”时触发：OAuth 号暂停 24 小时，API Key 号暂停 60 分钟。暂停期间照常检测，一旦恢复一致立即解除。它复用 sub2api 原有的“模型级限流”，账号列表会显示“模型 X 限流至 …”；只会解除检测器自己加的暂停，不会碰上游真实的 429 限流。
+**自动暂停**必须同时启用全局开关、auto_pause_enabled，并为所有目标成员配置匹配的 auto_pause_calibrations；仅判“可疑”不足以触发：OAuth 号暂停 24 小时，API Key 号暂停 60 分钟。暂停期间照常检测，一旦恢复一致立即解除。它复用 sub2api 原有的“模型级限流”，账号列表会显示“模型 X 限流至 …”；只会解除检测器自己加的暂停，不会碰上游真实的 429 限流。
 
 > 检测是统计判断，结果仅供参考，不能作为上游违约的证明。
 
@@ -79,7 +79,7 @@ modeltrace/
   ```
   不需要可以写 `{}`。
 
-其余保持默认即可（`base_url` 与 `host_api_base` 默认走 Docker 内网 `http://sub2api:8080`）。
+默认 auto_pause_calibrations 为空，因此先观测、不自动停号。其余保持默认即可（`base_url` 与 `host_api_base` 默认走 Docker 内网 `http://sub2api:8080`）。
 
 ### 4. 加入 Docker Compose
 
@@ -150,3 +150,13 @@ deploy/                                   Compose、密钥、Nginx 示例
 - **[ModelTrace](https://github.com/xqy2006/ModelTrace)**，作者 [xqy2006](https://github.com/xqy2006)。`modeltrace/` 中的指纹算法（`modeltrace/modeltrace/fingerprint.py`）与题库（`modeltrace/modeltrace/data/unified_bank.json`）原样取自上游 commit `55a2e4a`，文件哈希见 [`modeltrace/PROVENANCE.json`](modeltrace/PROVENANCE.json)。
 
 两个原项目的许可证文件按其要求保留在对应目录：[`patches/LICENSE`](patches/LICENSE)、[`modeltrace/LICENSE`](modeltrace/LICENSE)。
+
+
+## 0.1.16 安全与线路兼容说明
+
+- `enabled:false` 关闭自动调度，并阻止领取已排队的自动任务及自动暂停/恢复；明确的手动检测仍可执行。已开始的请求不强行中断，返回后不触发自动动作。
+- `auto_pause_calibrations` 默认 `[]`。每项必须包含正整数 `account_id`、精确路由 `model`、`reasoning_effort`、已完成线路校准的文档 `reference`。它是运维声明，不是检测器自动验证；不要填占位引用冒充验收。账号、路由、参数或注入提示词/插件版本发生变化时应撤销对应声明并重新校准。
+- 缺少匹配校准的单号或集群仅观测，不自动停用，也不会因一次未经校准的 match 自动恢复。集群全部支持该模型的成员都需要校准声明。
+- BPS 会注入提示词，并可能归一化 reasoning effort。请求参数 none 不证明上游实际 none；仅 HTTP200 或工具成功不是能力校准证据。
+- `model_aliases` 显式配置路由名到题库模型的直接映射，例如 `gpt-6-astra-basispoints` → `gpt-6-astra`；不自动裁剪后缀、不修改题库、不把别名支持当作校准通过。发现与请求保留路由名，指纹比较使用配置的题库模型。返回 model 仅接受请求名或它声明的目标，任意其他模型仍被拒绝。
+- 自动解除和手动重置仅在宿主确认成功后清理本地暂停状态。手动部分失败返回 `reset:false` 及失败账号，不再虚报完全恢复。

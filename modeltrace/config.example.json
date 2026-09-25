@@ -27,5 +27,9 @@
   "auto_pause_enabled": true,
   "pause_minutes_oauth": 1440,
   "pause_minutes_apikey": 60,
-  "paused_recheck_seconds_apikey": 1800
+  "paused_recheck_seconds_apikey": 1800,
+  "auto_pause_calibrations": [],
+  "model_aliases": {
+    "gpt-6-astra-basispoints": "gpt-6-astra"
+  }
 }

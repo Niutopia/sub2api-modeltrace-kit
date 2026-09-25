@@ -231,6 +231,7 @@ class ProbeTransport:
         client_factory: Any | None = None,
         probe_secret: str | None = None,
         reasoning_effort_overrides: dict[str, str] | None = None,
+        model_aliases: dict[str, str] | None = None,
         idle_timeout_seconds: int | float | None = None,
         total_timeout_seconds: int | float | None = None,
     ):
@@ -254,6 +255,7 @@ class ProbeTransport:
         self.client_factory = client_factory or httpx.AsyncClient
         self.probe_secret = probe_secret
         self.reasoning_effort_overrides = dict(reasoning_effort_overrides or {})
+        self.model_aliases = dict(model_aliases or {})
         self._request_started_at = 0.0
         self._request_detail: dict[str, Any] = {}
 
@@ -287,7 +289,7 @@ class ProbeTransport:
             "input": messages,
             "reasoning": {
                 "effort": self.reasoning_effort_overrides.get(
-                    model, DEFAULT_REASONING_EFFORTS.get(model, "none")
+                    model, self.reasoning_effort_overrides.get(self.model_aliases.get(model, model), DEFAULT_REASONING_EFFORTS.get(self.model_aliases.get(model, model), "none"))
                 )
             },
             "service_tier": "default",
@@ -331,8 +333,7 @@ class ProbeTransport:
             raise _ResponseTooLarge
         return text
 
-    @staticmethod
-    def _observe_model(payload: Any, observer: Any) -> bool:
+    def _observe_model(self, payload: Any, observer: Any) -> bool:
         """Record only structured Responses model fields.
 
         Model identity is deliberately restricted to the protocol's model
@@ -356,7 +357,7 @@ class ProbeTransport:
                 observer.upstream_model = candidate
             elif observer.upstream_model != candidate:
                 return False
-            if candidate != observer.expected_model:
+            if candidate not in {observer.expected_model, self.model_aliases.get(observer.expected_model)}:
                 return False
         return True
 
