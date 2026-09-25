@@ -147,6 +147,6 @@ deploy/                                   Compose、密钥、Nginx 示例
 这是个人二次开发的项目，基于以下两个开源项目：
 
 - **[sub2api](https://github.com/Wei-Shaw/sub2api)**，作者 [Wei-Shaw](https://github.com/Wei-Shaw)。`patches/` 中的补丁修改自 sub2api v0.2.8。
-- **[ModelTrace](https://github.com/xqy2006/ModelTrace)**，作者 [xqy2006](https://github.com/xqy2006)。`modeltrace/` 中的指纹算法（`modeltrace/fingerprint.py`）与题库（`modeltrace/data/unified_bank.json`）原样取自上游 commit `55a2e4a`，文件哈希见 [`modeltrace/PROVENANCE.json`](modeltrace/PROVENANCE.json)。
+- **[ModelTrace](https://github.com/xqy2006/ModelTrace)**，作者 [xqy2006](https://github.com/xqy2006)。`modeltrace/` 中的指纹算法（`modeltrace/modeltrace/fingerprint.py`）与题库（`modeltrace/modeltrace/data/unified_bank.json`）原样取自上游 commit `55a2e4a`，文件哈希见 [`modeltrace/PROVENANCE.json`](modeltrace/PROVENANCE.json)。
 
 两个原项目的许可证文件按其要求保留在对应目录：[`patches/LICENSE`](patches/LICENSE)、[`modeltrace/LICENSE`](modeltrace/LICENSE)。
