@@ -113,7 +113,7 @@ def make_service(tmp_path, fake_clock, host_client=None, transport=None, config_
 
 
 def test_version_is_0113():
-    assert __version__ == "0.1.16"
+    assert __version__ == "0.1.17"
 
 
 def test_account_unavailable_in_safe_message_codes():

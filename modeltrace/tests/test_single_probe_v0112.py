@@ -29,7 +29,7 @@ class CustomTestTransport:
 
 
 def test_version_is_0112():
-    assert __version__ in {"0.1.12", "0.1.13", "0.1.14", "0.1.16"}
+    assert __version__ in {"0.1.12", "0.1.13", "0.1.14", "0.1.16", "0.1.17"}
 
 
 def test_classify_sample_state_mjs_rules():

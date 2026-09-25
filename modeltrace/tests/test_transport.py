@@ -99,7 +99,7 @@ def test_responses_contract_is_explicit():
     assert payload["stream"] is True
     assert payload["store"] is False
     assert payload["reasoning"] == {"effort": "none"}
-    assert payload["service_tier"] == "default"
+    assert "service_tier" not in payload  # BPS rejects an explicit "default"
     assert payload["max_output_tokens"] == 2048
     assert payload["input"] == [
         {"role": "system", "content": [{"type": "input_text", "text": "system"}]},

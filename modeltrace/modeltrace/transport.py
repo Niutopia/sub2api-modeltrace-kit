@@ -292,7 +292,8 @@ class ProbeTransport:
                     model, self.reasoning_effort_overrides.get(self.model_aliases.get(model, model), DEFAULT_REASONING_EFFORTS.get(self.model_aliases.get(model, model), "none"))
                 )
             },
-            "service_tier": "default",
+            # service_tier is omitted (same as "default"): the BPS route rejects an
+            # explicit "default" with 422 Invalid request body.
             "stream": True,
             "store": False,
         }
