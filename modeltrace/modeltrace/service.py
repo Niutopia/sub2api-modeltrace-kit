@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import quote
 
 import httpx
 
@@ -32,6 +33,8 @@ SERVICE_TIER = "default"
 HISTORY_LIMIT = 16
 MANUAL_MIN_INTERVAL_SECONDS = 60
 STALE_AFTER_SECONDS = 3600
+ACCOUNT_SYNC_TIMEOUT_SECONDS = 4.0
+HOST_ACCOUNT_FETCH_TIMEOUT_SECONDS = 3.0
 
 SAFE_MESSAGE_CODES = frozenset({
     "insufficient_output", "insufficient_sample", "response_truncated",
@@ -61,6 +64,10 @@ class ModelNotSupported(Exception):
     pass
 
 
+class NotParticipating(Exception):
+    """The account exists on the host but is outside its scheduling pool."""
+
+
 class DuplicateQueue(Exception):
     pass
 
@@ -82,12 +89,12 @@ class EnqueueResult:
     model: str | None = None
 
 
-def utc_iso(timestamp: float | None) -> str | None:
+def utc_iso(timestamp: float | None, *, timespec: str = "seconds") -> str | None:
     if timestamp is None:
         return None
     return (
         datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
-        .isoformat(timespec="seconds")
+        .isoformat(timespec=timespec)
         .replace("+00:00", "Z")
     )
 
@@ -169,16 +176,18 @@ class HostClient:
         self._last_accounts: list[dict[str, Any]] = []
 
     def fetch_accounts(self, models: list[str]) -> tuple[list[dict[str, Any]], bool]:
-        models_param = ",".join(models)
-        url = f"{self.base_url}/api/v1/internal/modeltrace/accounts?models={models_param}"
+        models_param = quote(",".join(models), safe=",")
+        # include_inactive keeps accounts that are switched off (or cooling
+        # down) visible with their last result; they are never auto-probed.
+        url = f"{self.base_url}/api/v1/internal/modeltrace/accounts?models={models_param}&include_inactive=1"
         headers = {}
         if self.secret:
             headers["Authorization"] = f"Bearer {self.secret}"
         try:
             if self.client is not None:
-                resp = self.client.get(url, headers=headers, timeout=10.0)
+                resp = self.client.get(url, headers=headers, timeout=HOST_ACCOUNT_FETCH_TIMEOUT_SECONDS)
             else:
-                with httpx.Client(timeout=10.0) as cl:
+                with httpx.Client(timeout=HOST_ACCOUNT_FETCH_TIMEOUT_SECONDS) as cl:
                     resp = cl.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
@@ -269,6 +278,8 @@ class ModelTraceService:
         )
         self._retest_states: dict[int, dict[str, Any]] = {}
         self._last_account_refresh_at: float | None = None
+        self._account_refresh_lock = threading.Lock()
+        self._account_fetch_thread: threading.Thread | None = None
         host_base = config.host_api_base or os.environ.get("HOST_API_BASE")
         self.host_client = HostClient(host_base, secret=os.environ.get("MODELTRACE_SECRET")) if host_base else None
         self._stop = threading.Event()
@@ -412,8 +423,7 @@ class ModelTraceService:
         while not self._stop.is_set():
             now = self.clock()
             if self.config.per_account_enabled:
-                if self._last_account_refresh_at is None or (now - self._last_account_refresh_at >= 60):
-                    self._refresh_accounts(now)
+                self._refresh_accounts(now, if_due=True)
                 self._schedule_due_accounts(now)
                 # Monitors are no longer scheduled here, but a manual run from the
                 # channel page still lands in the monitor queue and must be served.
@@ -860,7 +870,24 @@ class ModelTraceService:
             "ranking": [],
         }
 
+    @staticmethod
+    def _pending_job_state(pending: sqlite3.Row | None) -> dict[str, Any]:
+        # Admission, eligibility and execution are different timestamps. None
+        # means no pending job, not an inferred successful probe.
+        return {
+            "running": pending is not None and pending["state"] == "running",
+            "queued": pending is not None and pending["state"] == "queued",
+            "queued_at": utc_iso(pending["requested_at"]) if pending is not None else None,
+            "available_at": utc_iso(pending["available_at"]) if pending is not None else None,
+            "started_at": utc_iso(pending["started_at"]) if pending is not None and pending["state"] == "running" else None,
+        }
+
     def snapshot(self, monitor_id: int, *, admin: bool = False) -> dict[str, Any]:
+        self._refresh_accounts(self.clock(), if_due=True)
+        with self.db.read_snapshot():
+            return self._snapshot(monitor_id, admin=admin)
+
+    def _snapshot(self, monitor_id: int, *, admin: bool = False) -> dict[str, Any]:
         monitor = self.config.monitors.get(monitor_id)
         if monitor is None:
             raise UnknownMonitor(monitor_id)
@@ -870,8 +897,41 @@ class ModelTraceService:
         history_rows = self.db.get_rounds(monitor_id, limit=HISTORY_LIMIT)
         latest = self._round_shape(latest_row) if latest_row is not None else self._synthetic_round(monitor, now=now)
         history = [self._round_shape(row) for row in history_rows]
-        state_next = float(state["next_run_at"]) if state["next_run_at"] is not None else None
+        account_view = (
+            self._per_account_monitor_view(monitor, history_rows, now=now)
+            if self.config.per_account_enabled else None
+        )
+        if account_view is not None:
+            # In per-account mode the channel shows the same rounds as the
+            # account page; channel-mode rounds from before the switch are old.
+            latest = account_view["latest"] or self._synthetic_round(monitor, now=now)
+            history = account_view["history"]
+        pending = self.db.get_pending_job(monitor_id)
+        # Per-account mode does not create recurring channel jobs. Persisted
+        # pending work is projected independently of that automatic schedule.
+        scheduled = (not self.config.per_account_enabled and self.config.enabled
+                     and monitor.enabled and self.is_supported(monitor))
+        state_next = float(state["next_run_at"]) if scheduled and state["next_run_at"] is not None else None
+        if pending is not None:
+            # Pending work owns the visible slot. A paused scheduled job is
+            # still queued, but has no executable countdown; manual work does.
+            can_claim = self.config.enabled or pending["trigger"] == "manual"
+            state_next = float(pending["available_at"]) if pending["state"] == "queued" and can_claim else None
+        last_checked = float(state["last_checked_at"]) if state["last_checked_at"] is not None else None
+        stale_after = max(STALE_AFTER_SECONDS, self.config.interval_seconds * 2)
+        schedule_mode = "scheduled" if scheduled else "manual"
+        pending_state = self._pending_job_state(pending)
+        if account_view is not None:
+            last_checked = account_view["last_checked_at"]
+            stale_after = account_view["stale_after"]
+            if pending is None:
+                state_next = account_view["next_run_at"]
+                if account_view["running"] is not None:
+                    pending_state = self._pending_job_state(account_view["running"])
+            if account_view["scheduled"] and self.config.enabled and monitor.enabled:
+                schedule_mode = "scheduled"
         public = {
+            "snapshot_at": utc_iso(now, timespec="microseconds"),
             "monitor_id": monitor.monitor_id,
             "model": monitor.model,
             "scope_label": self.config.scope_label,
@@ -883,14 +943,12 @@ class ModelTraceService:
             "service_tier": SERVICE_TIER,
             "enabled": bool(monitor.enabled),
             "supported": self.is_supported(monitor),
-            "running": self.db.is_running(monitor_id),
+            **pending_state,
+            "schedule_mode": schedule_mode,
             "interval_seconds": self.config.interval_seconds,
-            "last_checked_at": utc_iso(float(state["last_checked_at"])) if state["last_checked_at"] is not None else None,
+            "last_checked_at": utc_iso(last_checked),
             "next_run_at": utc_iso(state_next),
-            "stale": bool(
-                state["last_checked_at"] is not None
-                and now - float(state["last_checked_at"]) > max(STALE_AFTER_SECONDS, self.config.interval_seconds * 2)
-            ),
+            "stale": bool(last_checked is not None and now - last_checked > stale_after),
             "latest": latest,
             # History is deliberately oldest -> newest for charting.
             "history": history,
@@ -901,7 +959,7 @@ class ModelTraceService:
             "paused_budget": False,
             "paused_reconciliation": False,
             "next_run_after": None,
-            "accounts_summary": self.accounts_summary_for_model(monitor.model),
+            "accounts_summary": self._accounts_summary_for_model(monitor.model),
         }
         if admin:
             try:
@@ -910,7 +968,7 @@ class ModelTraceService:
                 upstream_statuses = []
             public["diagnostics"] = {
                 "cost_controls_enabled": False,
-                "queue_pending": self.db.has_pending(monitor_id),
+                "queue_pending": pending is not None,
                 "last_error_code": state["last_error_code"],
                 "last_upstream_statuses": upstream_statuses,
                 "auto_retests": 0, "retention_days": 90,
@@ -921,6 +979,71 @@ class ModelTraceService:
         return public
 
 
+    def _per_account_monitor_view(
+        self, monitor: MonitorConfig, monitor_rows: list[sqlite3.Row], *, now: float,
+    ) -> dict[str, Any]:
+        """Channel view of ``monitor.model``: per-account rounds of accounts in
+        the host pool (same data as the account page) merged with channel
+        rounds, newest first, so a recent account check supersedes an old
+        channel-mode result instead of sitting beside it."""
+        model = monitor.model
+        targets = [
+            t for t in self._get_all_targets()
+            if str(t["mode"]) != "retired" and t["participating"] and model in t["models"]
+        ]
+        rows: list[sqlite3.Row] = []
+        for target in targets:
+            for mid in self._pool_member_ids(target):
+                rows.extend(self.db.get_account_rounds(mid, model=model, limit=HISTORY_LIMIT))
+        # A manual reset is a neutral marker, not a check result.
+        rows = [r for r in rows if str(r["status"]) != "reset"]
+        rows.extend(monitor_rows)
+        rows.sort(key=lambda r: (float(r["checked_at"]), int(r["id"])), reverse=True)
+        rows = rows[:HISTORY_LIMIT]
+
+        def shape(row: sqlite3.Row) -> dict[str, Any]:
+            if "monitor_id" in row.keys():
+                return self._round_shape(row)
+            return {
+                "id": int(row["id"]),
+                "status": str(row["status"]),
+                "target_probability": _clamp_probability(row["target_probability"]),
+                "best_model": str(row["best_model"]) if row["best_model"] is not None else None,
+                "checked_at": utc_iso(float(row["checked_at"])),
+                "message_code": str(row["message_code"]),
+                "ranking": [
+                    {
+                        "model": str(item.get("model")),
+                        "probability": round(_clamp_probability(item.get("probability")) or 0.0, 6),
+                    }
+                    for item in self.db.decode_ranking(row)[:3]
+                    if isinstance(item, dict) and item.get("model") is not None
+                ],
+            }
+
+        next_runs: list[float] = []
+        running = None
+        scheduled = bool(self.config.enabled and targets)
+        for target in targets:
+            pending = self.db.get_pending_account_job(target["rep_account_id"], cluster_id=target["cluster_id"])
+            if pending is not None:
+                if str(pending["model"]) == model and pending["state"] == "running" and running is None:
+                    running = pending
+                continue
+            if target["next_run_at"] is not None and self._compute_target_next_model(target) == model:
+                next_runs.append(float(target["next_run_at"]))
+        intervals = [int(t["interval_seconds"]) for t in targets] or [self.config.idle_interval_seconds]
+        return {
+            "latest": shape(rows[0]) if rows else None,
+            # Oldest -> newest, as the channel chart expects.
+            "history": [shape(r) for r in reversed(rows)],
+            "last_checked_at": float(rows[0]["checked_at"]) if rows else None,
+            "next_run_at": min(next_runs) if scheduled and next_runs else None,
+            "stale_after": max(STALE_AFTER_SECONDS, max(intervals) * 2),
+            "scheduled": scheduled,
+            "running": running,
+        }
+
     # ------------------ Account-level Scheduling & Probing ------------------
 
     def _cluster_key_rotation(self, cluster_id: str, model: str) -> int:
@@ -929,6 +1052,42 @@ class ModelTraceService:
         idx = self._cluster_rotations.get((cluster_id, model), 0)
         self._cluster_rotations[(cluster_id, model)] = idx + 1
         return idx
+
+    @staticmethod
+    def _representative(members: list[sqlite3.Row]) -> sqlite3.Row:
+        """Lowest-id member still in the host's pool; switching one key off must
+        not stop the rest of its cluster from being checked."""
+        ordered = sorted(members, key=lambda a: int(a["account_id"]))
+        for member in ordered:
+            if bool(member["schedulable"]):
+                return member
+        return ordered[0]
+
+    @staticmethod
+    def _cluster_models(members: list[sqlite3.Row]) -> list[str]:
+        # Only keys that can actually be probed decide what the cluster serves;
+        # an all-off cluster still lists its models for the last results.
+        live = [m for m in members if bool(m["schedulable"])] or members
+        models: set[str] = set()
+        for member in live:
+            try:
+                models.update(json.loads(member["models_json"]))
+            except Exception:
+                pass
+        return sorted(models)
+
+    @staticmethod
+    def _pool_member_ids(target: dict[str, Any]) -> list[int]:
+        return [int(m["account_id"]) for m in target["members"] if bool(m["schedulable"])]
+
+    @staticmethod
+    def _participation(rep: sqlite3.Row) -> dict[str, Any]:
+        participating = bool(rep["schedulable"])
+        reason = rep["inactive_reason"] if "inactive_reason" in rep.keys() else None
+        return {
+            "participating": participating,
+            "inactive_reason": None if participating else (reason or "unschedulable"),
+        }
 
     def _get_target_and_members(self, account_id: int) -> tuple[dict[str, Any] | None, list[sqlite3.Row]]:
         acc = self.db.get_account(account_id)
@@ -944,15 +1103,8 @@ class ModelTraceService:
             if not cluster_members:
                 cluster_members = [acc]
             cluster_members.sort(key=lambda a: int(a["account_id"]))
-            rep = cluster_members[0]
-
-            models_set = set()
-            for m in cluster_members:
-                try:
-                    models_set.update(json.loads(m["models_json"]))
-                except Exception:
-                    pass
-            cluster_models = sorted(models_set)
+            rep = self._representative(cluster_members)
+            cluster_models = self._cluster_models(cluster_members)
 
             real_models_list: list[str] = []
             seen_real = set()
@@ -968,6 +1120,7 @@ class ModelTraceService:
 
             target = {
                 "target_type": "cluster",
+                **self._participation(rep),
                 "cluster_id": cid,
                 "cluster_name": acc["cluster_name"] if "cluster_name" in acc.keys() else None,
                 "rep_account_id": int(rep["account_id"]),
@@ -995,6 +1148,7 @@ class ModelTraceService:
                 rm = []
             target = {
                 "target_type": "single",
+                **self._participation(acc),
                 "cluster_id": None,
                 "cluster_name": None,
                 "rep_account_id": int(acc["account_id"]),
@@ -1028,14 +1182,8 @@ class ModelTraceService:
 
         for cid, members in cluster_groups.items():
             members.sort(key=lambda a: int(a["account_id"]))
-            rep = members[0]
-            models_set = set()
-            for m in members:
-                try:
-                    models_set.update(json.loads(m["models_json"]))
-                except Exception:
-                    pass
-            cluster_models = sorted(models_set)
+            rep = self._representative(members)
+            cluster_models = self._cluster_models(members)
 
             real_models_list = []
             seen_real = set()
@@ -1051,6 +1199,7 @@ class ModelTraceService:
 
             targets.append({
                 "target_type": "cluster",
+                **self._participation(rep),
                 "cluster_id": cid,
                 "cluster_name": rep["cluster_name"] if "cluster_name" in rep.keys() else None,
                 "rep_account_id": int(rep["account_id"]),
@@ -1078,6 +1227,7 @@ class ModelTraceService:
                 rm = []
             targets.append({
                 "target_type": "single",
+                **self._participation(acc),
                 "cluster_id": None,
                 "cluster_name": None,
                 "rep_account_id": int(acc["account_id"]),
@@ -1331,17 +1481,85 @@ class ModelTraceService:
             candidate += 3600
         return float(candidate)
 
-    def _refresh_accounts(self, now: float) -> None:
-        self._last_account_refresh_at = now
-        if not self.host_client:
-            return
-        all_models = sorted(set(self.bank_models) | set(self.config.model_aliases))
-        res = self.host_client.fetch_accounts(all_models)
-        if isinstance(res, tuple):
-            account_list, fetch_ok = res
-        else:
-            account_list, fetch_ok = res, True
+    def _fetch_accounts_before_deadline(self, models: list[str], deadline: float) -> Any:
+        # httpx timeouts bound individual I/O phases, not total response time.
+        # Keep at most one daemon fetch in flight and discard timed-out results;
+        # a late response must never publish stale rows after a newer save/GET.
+        previous = self._account_fetch_thread
+        if previous is not None and previous.is_alive():
+            previous.join(max(0.0, deadline - time.monotonic()))
+            if previous.is_alive():
+                return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        result: list[Any] = []
+        host_client = self.host_client
 
+        def fetch() -> None:
+            try:
+                result.append(host_client.fetch_accounts(models))
+            except Exception as exc:
+                logger.warning("host account sync failed: %s", type(exc).__name__)
+                result.append(([], False))
+
+        self._account_fetch_thread = threading.Thread(target=fetch, daemon=True, name="modeltrace-account-fetch")
+        self._account_fetch_thread.start()
+        self._account_fetch_thread.join(max(0.0, deadline - time.monotonic()))
+        if self._account_fetch_thread.is_alive():
+            return None
+        return result[0] if result else None
+
+    def _refresh_accounts(self, now: float, *, if_due: bool = False) -> None:
+        if not self.host_client or (if_due and not self.config.per_account_enabled):
+            return
+        # Account GETs share a 4s budget for lock, host and SQLite admission,
+        # below the existing Go proxy's 5s timeout. No paid probe holds this lock.
+        deadline = time.monotonic() + ACCOUNT_SYNC_TIMEOUT_SECONDS
+        if not self._account_refresh_lock.acquire(timeout=ACCOUNT_SYNC_TIMEOUT_SECONDS):
+            return
+        try:
+            if if_due and self._last_account_refresh_at is not None and now - self._last_account_refresh_at < 60:
+                return
+            self._last_account_refresh_at = self.clock()
+            all_models = sorted(set(self.bank_models) | set(self.config.model_aliases))
+            res = self._fetch_accounts_before_deadline(all_models, deadline)
+            if res is None or time.monotonic() >= deadline:
+                logger.warning("host account sync deadline exceeded; retaining committed snapshot")
+                return
+            if isinstance(res, tuple):
+                account_list, fetch_ok = res
+            else:
+                account_list, fetch_ok = res, True
+            if not fetch_ok:
+                # Never replay HostClient's old cached payload on failure. Only
+                # heal schedules from already committed local state.
+                with self.db.account_sync_transaction(timeout_seconds=deadline - time.monotonic()):
+                    self._reconcile_active_account_schedules(now)
+                return
+            if not isinstance(account_list, list):
+                logger.warning("host account sync rejected a non-list payload")
+                return
+            with self.db.account_sync_transaction(timeout_seconds=deadline - time.monotonic()):
+                self._apply_account_sync(account_list, now)
+        except (KeyError, TypeError, ValueError):
+            # Invalid data is not an authoritative deletion. Roll back the whole
+            # batch, including any model changes already applied to other keys.
+            logger.warning("host account sync rejected an invalid account payload")
+        except TimeoutError:
+            logger.warning("account sync lock deadline exceeded; retaining committed snapshot")
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            logger.warning("account sync database is busy; retaining committed snapshot")
+        finally:
+            self._account_refresh_lock.release()
+
+    def _apply_account_sync(self, account_list: list[dict[str, Any]], now: float) -> None:
+        previous_clusters: dict[str, list[sqlite3.Row]] = {}
+        for account in self.db.get_all_accounts():
+            if account["cluster_id"] and account["mode"] != "retired":
+                previous_clusters.setdefault(account["cluster_id"], []).append(account)
         fetched_ids = set()
         active_clusters = set()
         cluster_reals: dict[str, list[str]] = {}
@@ -1409,6 +1627,7 @@ class ModelTraceService:
             paused_models = acc.get("paused_models", [])
             if not isinstance(paused_models, list):
                 paused_models = []
+            inactive_reason = None if schedulable else (str(acc.get("inactive_reason") or "") or "unschedulable")
 
             mode = "active" if is_active else "idle"
             interval = self.config.active_interval_seconds if is_active else self.config.idle_interval_seconds
@@ -1416,7 +1635,9 @@ class ModelTraceService:
             existing = self.db.get_account(acct_id)
             if existing is None:
                 if is_active:
-                    initial_next_run = now
+                    # Cluster deadlines depend on all members' existing rounds,
+                    # not on when a new lowest-id key was discovered.
+                    initial_next_run = None if cid else now
                 else:
                     initial_next_run = self._compute_idle_next_run(acct_id, now, cluster_id=cid)
                     if (str(type_).lower() != "oauth") and any(pm.get("until") for pm in paused_models):
@@ -1438,6 +1659,7 @@ class ModelTraceService:
                     cluster_name=cname,
                     real_models=real_models,
                     paused_models=paused_models,
+                    inactive_reason=inactive_reason,
                     now=now,
                 )
             else:
@@ -1459,6 +1681,7 @@ class ModelTraceService:
                     cluster_name=cname,
                     real_models=real_models,
                     paused_models=paused_models,
+                    inactive_reason=inactive_reason,
                     now=now,
                 )
                 if (str(type_).lower() != "oauth") and any(pm.get("until") for pm in paused_models):
@@ -1472,20 +1695,14 @@ class ModelTraceService:
                     else:
                         idle_next = self._compute_idle_next_run(acct_id, now, cluster_id=cid)
                         self.db.set_account_next_run(acct_id, idle_next, now=now)
-                elif old_mode == "idle" and is_active:
-                    last_round = self.db.get_account_latest_round(acct_id)
-                    last_check_ts = float(last_round["checked_at"]) if last_round is not None else 0.0
-                    if (now - last_check_ts) > self.config.active_interval_seconds:
-                        self.db.set_account_next_run(acct_id, now, now=now)
                 elif old_mode == "active" and not is_active:
                     idle_next = self._compute_idle_next_run(acct_id, now, cluster_id=cid)
                     self.db.set_account_next_run(acct_id, idle_next, now=now)
 
-        if fetch_ok:
-            for local_acc in self.db.get_all_accounts():
-                local_id = int(local_acc["account_id"])
-                if local_id not in fetched_ids and str(local_acc["mode"]) != "retired":
-                    self.db.retire_account(local_id, now=now)
+        for local_acc in self.db.get_all_accounts():
+            local_id = int(local_acc["account_id"])
+            if local_id not in fetched_ids and str(local_acc["mode"]) != "retired":
+                self.db.retire_account(local_id, now=now)
 
         # Align scheduling for clusters: only the representative has next_run_at; others are None.
         # If representative changed, carry over next_run_at and last_model_index.
@@ -1497,14 +1714,24 @@ class ModelTraceService:
 
         for cid, members in cluster_accs.items():
             members.sort(key=lambda x: int(x["account_id"]))
-            rep = members[0]
+            rep = self._representative(members)
+            others = [m for m in members if int(m["account_id"]) != int(rep["account_id"])]
             rep_id = int(rep["account_id"])
             rep_next = rep["next_run_at"]
             rep_model_idx = rep["last_model_index"]
+            old_members = previous_clusters.get(cid, [])
+            old_rep = self._representative(old_members) if old_members else None
+            if old_rep is not None and int(old_rep["account_id"]) != rep_id:
+                # Capture before retirement clears the old representative's
+                # deadline. A newly discovered rep must not reset it to now.
+                rep_next = old_rep["next_run_at"]
+                rep_model_idx = old_rep["last_model_index"]
+                self.db.set_account_next_run(rep_id, rep_next, now=now)
+                self.db.set_account_last_model_index(rep_id, int(rep_model_idx), now=now)
 
             # If rep has no next_run_at, see if any other member had one
             if rep_next is None:
-                for other in members[1:]:
+                for other in others:
                     if other["next_run_at"] is not None:
                         rep_next = other["next_run_at"]
                         rep_model_idx = other["last_model_index"]
@@ -1515,9 +1742,11 @@ class ModelTraceService:
             # If still None, initialize it
             if rep_next is None:
                 if rep["mode"] == "active":
-                    rep_next = now
+                    rounds = [self.db.get_account_latest_round(int(m["account_id"])) for m in members]
+                    checked = [float(r["checked_at"]) for r in rounds if r is not None]
+                    rep_next = max(now, max(checked) + self.config.active_interval_seconds) if checked else now
                 else:
-                    rep_next = self._compute_idle_next_run(rep_id, now)
+                    rep_next = self._compute_idle_next_run(rep_id, now, cluster_id=cid)
                 self.db.set_account_next_run(rep_id, rep_next, now=now)
 
             rep_acc = self.db.get_account(rep_id)
@@ -1533,9 +1762,33 @@ class ModelTraceService:
                         self.db.set_account_next_run(rep_id, now + recheck_limit, now=now)
 
             # Ensure all non-rep members have next_run_at = NULL
-            for non_rep in members[1:]:
+            for non_rep in others:
                 if non_rep["next_run_at"] is not None:
                     self.db.set_account_next_run(int(non_rep["account_id"]), None, now=now)
+
+        self._reconcile_active_account_schedules(now)
+
+    def _reconcile_active_account_schedules(self, now: float) -> None:
+        # Reconcile AFTER choosing cluster representatives: the latest result
+        # can belong to a fallback key. An idle -> active transition must shorten
+        # the hourly deadline even when the last round is less than 5 minutes old.
+        # Recheck already-active targets too, to heal persisted stale deadlines.
+        latest_rounds = self.db.get_latest_rounds_for_all_accounts()
+        for target in self._get_all_targets():
+            if target["mode"] != "active" or not target["participating"]:
+                continue
+            checked_times = [
+                float(latest_rounds[aid]["checked_at"])
+                for aid in target["member_account_ids"] if aid in latest_rounds
+            ]
+            active_due = (
+                max(now, max(checked_times) + self.config.active_interval_seconds)
+                if checked_times else now
+            )
+            current_due = target["next_run_at"]
+            # Only pull a deadline forward; polling must never postpone work.
+            if current_due is None or float(current_due) > active_due:
+                self.db.set_account_next_run(target["rep_account_id"], active_due, now=now)
 
     def _schedule_due_accounts(self, now: float) -> None:
         if not self.config.enabled or not self.config.per_account_enabled:
@@ -1547,7 +1800,7 @@ class ModelTraceService:
             if not rep_acc or not bool(rep_acc["schedulable"]):
                 continue
             due_at = rep_acc["next_run_at"]
-            if due_at is None or self.db.has_pending_account(rep_id):
+            if due_at is None or self.db.has_pending_account(rep_id, cluster_id=target["cluster_id"]):
                 continue
             due_at_val = float(due_at)
             interval = int(target["interval_seconds"])
@@ -1621,9 +1874,11 @@ class ModelTraceService:
         model = job.model
         rep_account_id = job.account_id
         target, members = self._get_target_and_members(rep_account_id)
-        if target is None:
-            self._record_account_internal_error(job)
+        if (target is None or not target["participating"] or target["mode"] == "retired"
+                or model not in target["models"] or self.config.calibration_model_for(model) not in self.bank_models):
+            self.db.cancel_account_job(job.queue_id, now=self.clock(), reason="account_or_model_unavailable")
             return
+        rep_account_id = target["rep_account_id"]
 
         # Find eligible members supporting this model and schedulable
         eligible_members: list[sqlite3.Row] = []
@@ -1638,8 +1893,8 @@ class ModelTraceService:
                 eligible_members.append(m)
 
         if not eligible_members:
-            # Fallback to any member
-            eligible_members = [m for m in members if bool(m["schedulable"])] or members
+            self.db.cancel_account_job(job.queue_id, now=self.clock(), reason="account_or_model_unavailable")
+            return
 
         reasoning_effort = self.config.reasoning_effort_for(model)
 
@@ -1669,6 +1924,7 @@ class ModelTraceService:
         conclusion_best_model: str | None = None
 
         while total_requests < 5 and conclusion_status is None:
+            requests_before_cycle = total_requests
             challenges = generate_challenges(count=1)
             if len(challenges) != 1:
                 raise ValueError("challenge_generation_failed")
@@ -1692,6 +1948,12 @@ class ModelTraceService:
                     break
 
                 curr_acct_id = int(member["account_id"])
+                current_member = self.db.get_account(curr_acct_id)
+                if (current_member is None or not current_member["schedulable"]
+                        or current_member["mode"] == "retired"
+                        or current_member["cluster_id"] != target["cluster_id"]
+                        or model not in json.loads(current_member["models_json"])):
+                    continue
                 total_requests += 1
                 try:
                     result = self.transport.run(
@@ -1807,11 +2069,32 @@ class ModelTraceService:
 
                 break
 
+            if total_requests == requests_before_cycle:
+                # A refresh may remove all remaining candidates between retries.
+                # Do not loop forever or manufacture a result without sending.
+                if total_requests == 0:
+                    self.db.cancel_account_job(job.queue_id, now=self.clock(), reason="account_or_model_unavailable")
+                    return
+                break
+
         # Check loop conclusion or hit limit
         finish = self.clock()
+        original_mode = str(target["mode"])
+        original_interval = int(target["interval_seconds"])
+        # A force refresh may change the representative while HTTP is in flight.
+        # Publish completion to the current target, not the queue's former key.
+        current_target, current_members = self._get_target_and_members(job.account_id)
+        if current_target is not None:
+            target, members = current_target, current_members
+            rep_account_id = target["rep_account_id"]
         mode = str(target["mode"])
         interval = int(target["interval_seconds"])
         regular_next_run = (finish + interval) if mode == "active" else self._compute_idle_next_run(rep_account_id, finish)
+        # A mode change may shorten, but must not postpone, the deadline that
+        # this in-flight job would otherwise have produced.
+        original_next_run = ((finish + original_interval) if original_mode == "active"
+                             else self._compute_idle_next_run(rep_account_id, finish))
+        regular_next_run = min(regular_next_run, original_next_run)
 
         if conclusion_status is not None:
             final_status = conclusion_status
@@ -1881,7 +2164,9 @@ class ModelTraceService:
         queued_count = 0
         targets = self._get_all_targets()
         for target in targets:
-            if model not in target["models"] or self.db.has_pending_account(target["rep_account_id"]):
+            if not target["participating"]:
+                continue
+            if model not in target["models"] or self.db.has_pending_account(target["rep_account_id"], cluster_id=target["cluster_id"]):
                 continue
             queued, _ = self.db.enqueue_account(
                 target["rep_account_id"], model, now=now, available_at=now, trigger="manual", retest_index=0,
@@ -1928,13 +2213,22 @@ class ModelTraceService:
         )
         return {"reset": True, "resumed": resumed}
 
-    def enqueue_manual_account(self, account_id: int, *, model: str | None = None) -> EnqueueResult:
+    def enqueue_manual_account(
+        self, account_id: int, *, model: str | None = None, force_refresh: bool = False,
+    ) -> EnqueueResult:
         now = self.clock()
+        # HTTP admission refreshes even immediately after a periodic fetch.
+        if force_refresh and self.config.per_account_enabled:
+            self._refresh_accounts(now)
         target, members = self._get_target_and_members(account_id)
         if target is None:
             raise UnknownAccount(account_id)
+        if not target["participating"] or str(target["mode"]) == "retired":
+            # The host refuses probes for accounts outside its pool; a manual
+            # run would only overwrite the last real result with an error.
+            raise NotParticipating(account_id)
         rep_id = target["rep_account_id"]
-        if self.db.has_pending_account(rep_id):
+        if self.db.has_pending_account(rep_id, cluster_id=target["cluster_id"]):
             raise DuplicateQueue(account_id)
 
         target_models = target["models"]
@@ -1959,16 +2253,25 @@ class ModelTraceService:
             raise DuplicateQueue(account_id)
         return EnqueueResult(True, qid, model=model_to_use)
 
-    def account_snapshot(self, account_id: int) -> dict[str, Any]:
+    def account_snapshot(self, account_id: int, *, force_refresh: bool = False) -> dict[str, Any]:
+        # HTTP GETs opt into synchronization without a new query parameter;
+        # direct/internal projections remain read-only by default.
+        if force_refresh and self.config.per_account_enabled:
+            self._refresh_accounts(self.clock())
+        with self.db.read_snapshot():
+            return self._account_snapshot(account_id)
+
+    def _account_snapshot(self, account_id: int, *, now: float | None = None) -> dict[str, Any]:
+        now = self.clock() if now is None else now
         target, members = self._get_target_and_members(account_id)
         if target is None:
             raise UnknownAccount(account_id)
 
         member_ids = target["member_account_ids"]
-        # Fetch all rounds for all members
+        # Fetch enough rounds per member for the combined recent history.
         member_rounds: list[sqlite3.Row] = []
         for mid in member_ids:
-            member_rounds.extend(self.db.get_account_rounds(mid, limit=100))
+            member_rounds.extend(self.db.get_account_rounds(mid, limit=12))
         member_rounds.sort(key=lambda r: (float(r["checked_at"]), int(r["id"])), reverse=True)
 
         def _format_acc_round(r: Any) -> dict[str, Any]:
@@ -2000,9 +2303,14 @@ class ModelTraceService:
 
         target_models = target["models"]
         per_model = []
-        now = self.clock()
         for mod in target_models:
-            mod_rounds = [r for r in member_rounds if str(r["model"]) == mod]
+            # Limit each model independently: a frequently checked model must
+            # not push another model's last result out of the detail view.
+            mod_rounds = [
+                r for mid in member_ids
+                for r in self.db.get_account_rounds(mid, model=mod, limit=12)
+            ]
+            mod_rounds.sort(key=lambda r: (float(r["checked_at"]), int(r["id"])), reverse=True)
             mod_latest = _format_acc_round(mod_rounds[0]) if mod_rounds else None
             mod_history = [_format_acc_round(r) for r in mod_rounds[:12]]
             paused_until = self._get_model_paused_until(members, mod, now)
@@ -2020,45 +2328,94 @@ class ModelTraceService:
         latest = _format_acc_round(member_rounds[0]) if member_rounds else None
         history = [_format_acc_round(r) for r in member_rounds[:12]]
 
+        # Each key keeps its own last result per model, including keys that
+        # are switched off, so a cluster row can show every key.
+        member_views = []
+        for m in members:
+            try:
+                m_models = json.loads(m["models_json"])
+            except Exception:
+                m_models = []
+            m_latest = {}
+            for mod in m_models:
+                rows = self.db.get_account_rounds(int(m["account_id"]), model=mod, limit=1)
+                m_latest[mod] = _format_acc_round(rows[0]) if rows else None
+            m_reason = m["inactive_reason"] if "inactive_reason" in m.keys() else None
+            member_views.append({
+                "account_id": int(m["account_id"]),
+                "name": str(m["name"]),
+                "participating": bool(m["schedulable"]),
+                "inactive_reason": None if bool(m["schedulable"]) else (m_reason or "unschedulable"),
+                "models": m_models,
+                "latest_by_model": m_latest,
+            })
+
         rep_id = target["rep_account_id"]
         rep_acc = self.db.get_account(rep_id)
+        pending = self.db.get_pending_account_job(rep_id, cluster_id=target["cluster_id"])
 
         retest_progress = None
 
         last_real_str = utc_iso(float(rep_acc["last_real_request_at"])) if (rep_acc and rep_acc["last_real_request_at"] is not None) else None
-        next_run_str = utc_iso(float(rep_acc["next_run_at"])) if (rep_acc and rep_acc["next_run_at"] is not None) else None
+        scheduled = bool(
+            self.config.enabled and self.config.per_account_enabled
+            and rep_acc and rep_acc["schedulable"]
+            and str(target["mode"]) != "retired" and target_models
+        )
+        next_run = rep_acc["next_run_at"] if scheduled else None
+        next_model = self._compute_target_next_model(target) if scheduled and next_run is not None else None
+        if pending is not None:
+            next_model = str(pending["model"])
+            can_claim = self.config.per_account_enabled and (self.config.enabled or pending["trigger"] == "manual")
+            next_run = pending["available_at"] if pending["state"] == "queued" and can_claim else None
 
         return {
+            "snapshot_at": utc_iso(now, timespec="microseconds"),
             "account_id": account_id,
             "cluster_id": target["cluster_id"],
             "cluster_name": target["cluster_name"],
             "member_account_ids": member_ids,
             "name": str(target["name"]),
             "models": target_models,
-            "next_model": self._compute_target_next_model(target),
+            "participating": bool(target["participating"]),
+            "inactive_reason": target["inactive_reason"],
+            "members": member_views,
+            # Admission advances rotation; pending work owns the visible model
+            # until it finishes. Idle snapshots forecast the next scheduled job.
+            "next_model": next_model,
             "per_model": per_model,
             "mode": str(target["mode"]),
             "interval_seconds": int(target["interval_seconds"]),
             "last_real_request_at": last_real_str,
-            "next_run_at": next_run_str,
-            "running": self.db.is_account_running(rep_id),
-            "queued": self.db.has_pending_account(rep_id),
+            "next_run_at": utc_iso(next_run),
+            **self._pending_job_state(pending),
+            "schedule_mode": "scheduled" if scheduled else "manual",
             "latest": latest,
             "history": history,
             "retest_progress": retest_progress,
         }
 
-    def all_accounts_snapshot(self) -> dict[str, Any]:
-        targets = self._get_all_targets()
-        return {
-            "accounts": [
-                self.account_snapshot(target["rep_account_id"])
-                for target in targets
-                if str(target["mode"]) != "retired"
-            ]
-        }
+    def all_accounts_snapshot(self, *, force_refresh: bool = False) -> dict[str, Any]:
+        if force_refresh and self.config.per_account_enabled:
+            self._refresh_accounts(self.clock())
+        with self.db.read_snapshot():
+            now = self.clock()
+            targets = self._get_all_targets()
+            return {
+                "snapshot_at": utc_iso(now, timespec="microseconds"),
+                "accounts": [
+                    self._account_snapshot(target["rep_account_id"], now=now)
+                    for target in targets
+                    if str(target["mode"]) != "retired"
+                ]
+            }
 
     def accounts_summary_for_model(self, model: str) -> dict[str, Any]:
+        self._refresh_accounts(self.clock(), if_due=True)
+        with self.db.read_snapshot():
+            return self._accounts_summary_for_model(model)
+
+    def _accounts_summary_for_model(self, model: str) -> dict[str, Any]:
         targets = self._get_all_targets()
         latest_by_account = self.db.get_latest_rounds_for_all_accounts(model)
         total = 0
@@ -2069,7 +2426,7 @@ class ModelTraceService:
         active_count = 0
 
         for target in targets:
-            if str(target["mode"]) == "retired":
+            if str(target["mode"]) == "retired" or not target["participating"]:
                 continue
             if model not in target["models"]:
                 continue
@@ -2077,8 +2434,8 @@ class ModelTraceService:
             if str(target["mode"]) == "active":
                 active_count += 1
 
-            # Latest round for this model across all members of the target.
-            mod_rounds = [latest_by_account[mid] for mid in target["member_account_ids"] if mid in latest_by_account]
+            # Latest round for this model across the target's keys in the pool.
+            mod_rounds = [latest_by_account[mid] for mid in self._pool_member_ids(target) if mid in latest_by_account]
             if mod_rounds:
                 mod_rounds.sort(key=lambda r: (float(r["checked_at"]), int(r["id"])), reverse=True)
                 latest_r = mod_rounds[0]

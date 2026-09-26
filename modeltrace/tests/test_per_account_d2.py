@@ -113,7 +113,7 @@ def make_service(tmp_path, fake_clock, host_client=None, transport=None, config_
 
 
 def test_version_is_0113():
-    assert __version__ == "0.1.17"
+    assert __version__ == "0.1.19"
 
 
 def test_account_unavailable_in_safe_message_codes():
@@ -164,7 +164,7 @@ def test_enter_active_enqueues_immediately_if_over_300s(tmp_path, fake_clock):
     """When an account transitions from idle to active, if >300s since last check, enqueue immediately."""
     from modeltrace.service import utc_iso
     t0 = 1700000000.0
-    fake_clock.current = t0
+    fake_clock.value = t0
 
     # Initially idle (no recent real request)
     host = MockHostClient(accounts_data=[
@@ -463,22 +463,14 @@ def test_old_monitor_endpoints_and_api_remain_available(tmp_path, fake_clock, mo
     assert "accounts_summary" in data
 
     # POST /accounts/17/run
-    # First seed account 17
-    svc.db.upsert_account_sync(
-        account_id=17,
-        name="test",
-        platform="openai",
-        type_="oauth",
-        schedulable=True,
-        models=["gpt-5.6-sol"],
-        last_real_request_at=None,
-        last_real_model=None,
-        real_requests_10m=0,
-        mode="idle",
-        interval_seconds=3600,
-        next_run_at=None,
-        now=fake_clock(),
-    )
+    # The HTTP endpoint refreshes authoritative membership before admission.
+    # Seed the host, not only SQLite (an empty successful host list means deleted).
+    host.accounts_data = [{
+        "account_id": 17, "name": "test", "platform": "openai", "type": "oauth",
+        "schedulable": True, "models": ["gpt-5.6-sol"],
+        "last_real_request_at": None, "real_models_10m": [],
+    }]
+    svc._refresh_accounts(fake_clock())
     res_run = client.post("/accounts/17/run", headers=headers)
     assert res_run.status_code == 202
     assert res_run.get_json()["queued"] is True
@@ -699,7 +691,7 @@ def test_host_client_default_transport_fetches_accounts(monkeypatch):
     accounts, ok = client.fetch_accounts(["gpt-6-astra", "gpt-5.6-sol"])
     assert ok is True
     assert accounts == [{"account_id": 7}]
-    assert seen["url"] == "http://sub2api:8080/api/v1/internal/modeltrace/accounts?models=gpt-6-astra,gpt-5.6-sol"
+    assert seen["url"] == "http://sub2api:8080/api/v1/internal/modeltrace/accounts?models=gpt-6-astra,gpt-5.6-sol&include_inactive=1"
     assert seen["auth"] == "Bearer s3cret"
 
 

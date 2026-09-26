@@ -1,35 +1,34 @@
 {
   "base_url": "http://sub2api:8080/v1",
   "api_key": "REPLACE_WITH_A_DEDICATED_SUB2API_API_KEY",
-  "enabled": true,
-  "interval_seconds": 600,
-  "auto_retests": 0,
-  "scope_label": "Responses 整链路（独立于连通性探测）",
-  "max_response_bytes": 8388608,
-  "max_prompt_bytes": 65536,
   "host_api_base": "http://sub2api:8080",
+  "enabled": true,
+  "scope_label": "Responses 整链路（独立于连通性探测）",
+
   "per_account_enabled": true,
   "active_interval_seconds": 300,
   "idle_interval_seconds": 3600,
   "active_window_seconds": 600,
+
   "monitors": {
-    "1": {
-      "model": "gpt-5.6-sol",
-      "enabled": false,
-      "supported": true
-    },
-    "2": {
-      "model": "gpt-6-astra",
-      "enabled": false,
-      "supported": true
-    }
+    "1": { "model": "gpt-6-astra", "enabled": false, "supported": true }
   },
+
+  "reasoning_effort_overrides": {
+    "gpt-6-astra": "low"
+  },
+  "model_aliases": {
+    "gpt-6-astra-backup": "gpt-6-astra"
+  },
+
   "auto_pause_enabled": true,
+  "auto_pause_calibrations": [],
   "pause_minutes_oauth": 1440,
   "pause_minutes_apikey": 60,
   "paused_recheck_seconds_apikey": 1800,
-  "auto_pause_calibrations": [],
-  "model_aliases": {
-    "gpt-6-astra-basispoints": "gpt-6-astra"
-  }
+
+  "interval_seconds": 600,
+  "auto_retests": 0,
+  "max_response_bytes": 8388608,
+  "max_prompt_bytes": 65536
 }

@@ -1,6 +1,6 @@
 {
   "service": "modeltrace-service",
-  "version": "0.1.13",
+  "version": "0.1.19",
   "upstream": {
     "repository": "https://github.com/xqy2006/ModelTrace",
     "commit": "55a2e4a",

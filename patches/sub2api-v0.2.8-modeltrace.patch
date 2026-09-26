@@ -28,6 +28,140 @@ index d77f515e1..5bf14b6e8 100644
  	jwtAuthMiddleware := middleware.NewJWTAuthMiddleware(authService, userService, settingService, auditLogService)
  	optionalJWTAuthMiddleware := middleware.NewOptionalJWTAuthMiddleware(authService, userService, settingService, auditLogService)
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService, auditLogService)
+diff --git a/backend/internal/handler/admin/modeltrace_accounts_model_sync_test.go b/backend/internal/handler/admin/modeltrace_accounts_model_sync_test.go
+new file mode 100644
+index 000000000..16835dcc9
+--- /dev/null
++++ b/backend/internal/handler/admin/modeltrace_accounts_model_sync_test.go
+@@ -0,0 +1,128 @@
++package admin
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/require"
++)
++
++func modelTraceHandlerSyncWhitelist(models ...string) map[string]any {
++	mapping := make(map[string]any, len(models))
++	for _, model := range models {
++		mapping[model] = model
++	}
++	return mapping
++}
++
++func TestAccountHandler_ModelTraceModelListDetailKeepsWhitelist(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	svc := newStubAdminService()
++	svc.getAccountResult = &service.Account{
++		ID: 42, Name: "231", Platform: service.PlatformOpenAI,
++		Type: service.AccountTypeAPIKey, Status: service.StatusActive,
++		Credentials: map[string]any{"api_key": "secret-test-key"},
++	}
++	h := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
++	router := gin.New()
++	router.GET("/api/v1/admin/accounts/:id", h.GetByID)
++
++	for _, models := range [][]string{
++		{"gpt-6-astra"},
++		{"codex-auto-review", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-reserve"},
++	} {
++		mapping := modelTraceHandlerSyncWhitelist(models...)
++		svc.getAccountResult.Credentials["model_mapping"] = mapping
++		w := httptest.NewRecorder()
++		router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/accounts/42", nil))
++		require.Equal(t, http.StatusOK, w.Code)
++		var payload struct {
++			Data struct {
++				ID                int64           `json:"id"`
++				Name              string          `json:"name"`
++				Credentials       map[string]any  `json:"credentials"`
++				CredentialsStatus map[string]bool `json:"credentials_status"`
++			} `json:"data"`
++		}
++		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &payload))
++		require.Equal(t, int64(42), payload.Data.ID)
++		require.Equal(t, "231", payload.Data.Name)
++		require.Equal(t, mapping, payload.Data.Credentials["model_mapping"])
++		require.NotContains(t, payload.Data.Credentials, "api_key")
++		require.True(t, payload.Data.CredentialsStatus["has_api_key"])
++		require.NotContains(t, w.Body.String(), "secret-test-key")
++	}
++}
++
++func TestAccountHandler_ModelTraceModelListSaveForwardsWhitelist(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	svc := newStubAdminService()
++	h := NewAccountHandler(svc, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
++	router := gin.New()
++	router.PUT("/api/v1/admin/accounts/:id", h.Update)
++	mapping := modelTraceHandlerSyncWhitelist(
++		"codex-auto-review", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol",
++		"gpt-5.6-terra", "gpt-6-astra", "gpt-reserve",
++	)
++	body, err := json.Marshal(map[string]any{"name": "231", "credentials": map[string]any{
++		"base_url": "https://provider.example/v1", "model_mapping": mapping,
++	}})
++	require.NoError(t, err)
++	w := httptest.NewRecorder()
++	req := httptest.NewRequest(http.MethodPut, "/api/v1/admin/accounts/42", strings.NewReader(string(body)))
++	req.Header.Set("Content-Type", "application/json")
++	router.ServeHTTP(w, req)
++	require.Equal(t, http.StatusOK, w.Code)
++	require.Equal(t, 1, svc.updateAccountCalls)
++	require.Equal(t, "231", svc.lastUpdateAccountInput.Name)
++	require.Equal(t, mapping, svc.lastUpdateAccountInput.Credentials["model_mapping"])
++}
++
++func TestModelTraceHandler_ModelListReadsAreNotCached(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	originalTransport := http.DefaultTransport
++	t.Cleanup(func() { http.DefaultTransport = originalTransport })
++	t.Setenv("MODELTRACE_INTERNAL_URL", "http://127.0.0.1:8081")
++	t.Setenv("MODELTRACE_SECRET", "test-secret")
++	h := NewModelTraceHandler()
++	router := gin.New()
++	router.GET("/api/v1/admin/modeltrace/accounts", h.GetAccounts)
++	router.GET("/api/v1/admin/modeltrace/accounts/:account_id", h.GetAccountDetail)
++
++	for _, suffix := range []string{"/accounts", "/accounts/42"} {
++		t.Run(suffix, func(t *testing.T) {
++			calls := 0
++			var currentBody string
++			http.DefaultTransport = handlerProxyRoundTripFunc(func(req *http.Request) (*http.Response, error) {
++				calls++
++				require.Equal(t, http.MethodGet, req.Method)
++				require.Equal(t, suffix, req.URL.Path)
++				require.Equal(t, "Bearer test-secret", req.Header.Get("Authorization"))
++				w := httptest.NewRecorder()
++				w.Header().Set("Content-Type", "application/json")
++				_, _ = w.WriteString(currentBody)
++				return w.Result(), nil
++			})
++			for _, models := range [][]string{{"gpt-6-astra"}, {"gpt-6-astra", "gpt-5.6-sol"}} {
++				account := map[string]any{"account_id": 42, "name": "231", "models": models}
++				var payload any = account
++				if suffix == "/accounts" {
++					payload = map[string]any{"accounts": []any{account}}
++				}
++				body, err := json.Marshal(payload)
++				require.NoError(t, err)
++				currentBody = string(body)
++				w := httptest.NewRecorder()
++				router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/admin/modeltrace"+suffix, nil))
++				require.Equal(t, http.StatusOK, w.Code)
++				require.JSONEq(t, currentBody, w.Body.String())
++			}
++			require.Equal(t, 2, calls, "each GET must reach the sidecar, without waiting for a Go cache TTL")
++		})
++	}
++}
 diff --git a/backend/internal/handler/admin/modeltrace_handler.go b/backend/internal/handler/admin/modeltrace_handler.go
 new file mode 100644
 index 000000000..ce36087f0
@@ -930,10 +1064,10 @@ index f7126904d..ae6fefe10 100644
  // BuildInfo contains build-time information
 diff --git a/backend/internal/handler/internal_modeltrace_handler.go b/backend/internal/handler/internal_modeltrace_handler.go
 new file mode 100644
-index 000000000..445f32bbb
+index 000000000..52282a9e6
 --- /dev/null
 +++ b/backend/internal/handler/internal_modeltrace_handler.go
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,169 @@
 +package handler
 +
 +import (
@@ -990,7 +1124,8 @@ index 000000000..445f32bbb
 +		}
 +	}
 +
-+	resp, err := h.accountsService.GetSchedulableAccounts(c.Request.Context(), requestedModels)
++	includeInactive := c.Query("include_inactive") == "1"
++	resp, err := h.accountsService.GetAccounts(c.Request.Context(), requestedModels, includeInactive)
 +	if err != nil {
 +		response.Error(c, http.StatusInternalServerError, "Failed to retrieve accounts")
 +		return
@@ -2116,10 +2251,10 @@ index 000000000..23141d0d4
 +}
 diff --git a/backend/internal/pkg/modeltrace/client.go b/backend/internal/pkg/modeltrace/client.go
 new file mode 100644
-index 000000000..28d0ed6b9
+index 000000000..2720a403e
 --- /dev/null
 +++ b/backend/internal/pkg/modeltrace/client.go
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,230 @@
 +// Package modeltrace exposes a bounded, authenticated private sidecar bridge.
 +// It never accepts a caller-provided upstream URL or credentials.
 +package modeltrace
@@ -2158,23 +2293,29 @@ index 000000000..28d0ed6b9
 +	Ranking           []Candidate `json:"ranking"`
 +}
 +type Snapshot struct {
-+	MonitorID            int64   `json:"monitor_id"`
-+	Model                string  `json:"model"`
-+	ScopeLabel           string  `json:"scope_label"`
-+	Enabled              bool    `json:"enabled"`
-+	Supported            bool    `json:"supported"`
-+	Running              bool    `json:"running"`
-+	IntervalSeconds      int     `json:"interval_seconds"`
-+	LastCheckedAt        *string `json:"last_checked_at"`
-+	NextRunAt            *string `json:"next_run_at"`
-+	Stale                bool    `json:"stale"`
-+	PausedBudget         bool    `json:"paused_budget"`
-+	PausedReconciliation bool    `json:"paused_reconciliation"`
-+	NextRunAfter         *string `json:"next_run_after"`
-+	Latest               *Round  `json:"latest"`
-+	History              []Round `json:"history"`
-+	Protocol             string  `json:"protocol"`
-+	ReasoningEffort      string          `json:"reasoning_effort"`
++	MonitorID            int64            `json:"monitor_id"`
++	Model                string           `json:"model"`
++	ScopeLabel           string           `json:"scope_label"`
++	Enabled              bool             `json:"enabled"`
++	Supported            bool             `json:"supported"`
++	Running              bool             `json:"running"`
++	Queued               bool             `json:"queued"`
++	ScheduleMode         string           `json:"schedule_mode"`
++	SnapshotAt           string           `json:"snapshot_at"`
++	QueuedAt             *string          `json:"queued_at"`
++	AvailableAt          *string          `json:"available_at"`
++	StartedAt            *string          `json:"started_at"`
++	IntervalSeconds      int              `json:"interval_seconds"`
++	LastCheckedAt        *string          `json:"last_checked_at"`
++	NextRunAt            *string          `json:"next_run_at"`
++	Stale                bool             `json:"stale"`
++	PausedBudget         bool             `json:"paused_budget"`
++	PausedReconciliation bool             `json:"paused_reconciliation"`
++	NextRunAfter         *string          `json:"next_run_after"`
++	Latest               *Round           `json:"latest"`
++	History              []Round          `json:"history"`
++	Protocol             string           `json:"protocol"`
++	ReasoningEffort      string           `json:"reasoning_effort"`
 +	RetestProgress       *RetestProgress  `json:"retest_progress"`
 +	ServiceTier          string           `json:"service_tier"`
 +	AccountsSummary      *AccountsSummary `json:"accounts_summary,omitempty"`
@@ -2400,10 +2541,10 @@ index 000000000..541cb9216
 +}
 diff --git a/backend/internal/pkg/modeltrace/client_test.go b/backend/internal/pkg/modeltrace/client_test.go
 new file mode 100644
-index 000000000..ec07db7d7
+index 000000000..86a8df6bc
 --- /dev/null
 +++ b/backend/internal/pkg/modeltrace/client_test.go
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,315 @@
 +package modeltrace
 +
 +import (
@@ -2662,8 +2803,146 @@ index 000000000..ec07db7d7
 +	require.NoError(t, json.Unmarshal([]byte(rawNull), &sNull))
 +	require.Nil(t, sNull.RetestProgress)
 +}
++
++func TestModelTraceSchedulingFieldsRemainIndependentOfResult(t *testing.T) {
++	for _, tc := range []struct {
++		name        string
++		mode        string
++		queued      bool
++		running     bool
++		queuedAt    string
++		availableAt string
++		startedAt   string
++	}{
++		{"manual queued", "manual", true, false, `"2026-09-25T00:00:01+00:00"`, `"2026-09-25T00:00:02+00:00"`, `null`},
++		{"manual running", "manual", false, true, `"2026-09-25T00:00:01+00:00"`, `"2026-09-25T00:00:02+00:00"`, `"2026-09-25T00:00:03+00:00"`},
++		{"scheduled idle", "scheduled", false, false, `null`, `null`, `null`},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				fmt.Fprintf(w, `{"monitor_id":5,"model":"model-current","queued":%t,"running":%t,"schedule_mode":%q,"snapshot_at":"2026-09-25T00:00:04.123456+00:00","queued_at":%s,"available_at":%s,"started_at":%s,"next_run_at":null,"last_checked_at":"2026-09-24T00:00:00Z","history":[],"latest":{"id":1,"status":"suspect","target_probability":0.2,"checked_at":"2026-09-24T00:00:00Z"},"private_job":"test-secret"}`, tc.queued, tc.running, tc.mode, tc.queuedAt, tc.availableAt, tc.startedAt)
++			}))
++			defer srv.Close()
++			t.Setenv("MODELTRACE_INTERNAL_URL", srv.URL)
++			t.Setenv("MODELTRACE_SECRET", "test-secret")
++			s, err := Get(context.Background(), 5, "model-current")
++			require.NoError(t, err)
++			require.Equal(t, tc.queued, s.Queued)
++			require.Equal(t, tc.running, s.Running)
++			require.Equal(t, tc.mode, s.ScheduleMode)
++			require.Equal(t, "2026-09-25T00:00:04.123456+00:00", s.SnapshotAt)
++			require.Equal(t, "2026-09-24T00:00:00Z", *s.LastCheckedAt)
++			require.Nil(t, s.NextRunAt)
++			require.Equal(t, "suspect", s.Latest.Status)
++			b, err := json.Marshal(s)
++			require.NoError(t, err)
++			require.Contains(t, string(b), `"queued_at":`+tc.queuedAt)
++			require.Contains(t, string(b), `"available_at":`+tc.availableAt)
++			require.Contains(t, string(b), `"started_at":`+tc.startedAt)
++			require.Contains(t, string(b), `"schedule_mode":`+fmt.Sprintf("%q", tc.mode))
++			require.NotContains(t, string(b), "private_job")
++			require.NotContains(t, string(b), "test-secret")
++		})
++	}
++}
++
++func TestAccountTraceReadViewFieldsPassThrough(t *testing.T) {
++	body := `{"snapshot_at":"2026-09-25T00:00:04.123456+00:00","accounts":[{"account_id":17,"snapshot_at":"2026-09-25T00:00:04.123456+00:00","schedule_mode":"manual","models":["new-probeable-model"],"next_model":"new-probeable-model","queued":true,"running":false,"queued_at":"2026-09-25T00:00:01Z","available_at":"2026-09-25T00:00:02Z","started_at":null,"per_model":[{"model":"removed-history-model","latest":null,"history":[]}]}]}`
++	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, "/accounts", r.URL.Path)
++		require.Equal(t, http.MethodGet, r.Method)
++		w.Write([]byte(body))
++	}))
++	defer srv.Close()
++	t.Setenv("MODELTRACE_INTERNAL_URL", srv.URL)
++	t.Setenv("MODELTRACE_SECRET", "test-secret")
++	result, err := GetAccounts(context.Background())
++	require.NoError(t, err)
++	require.JSONEq(t, body, string(result.Body))
++}
+diff --git a/backend/internal/repository/account_model_limit_preserve_integration_test.go b/backend/internal/repository/account_model_limit_preserve_integration_test.go
+new file mode 100644
+index 000000000..1abfa4adb
+--- /dev/null
++++ b/backend/internal/repository/account_model_limit_preserve_integration_test.go
+@@ -0,0 +1,75 @@
++//go:build integration
++
++package repository
++
++import (
++	"context"
++	"encoding/json"
++	"testing"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/stretchr/testify/require"
++)
++
++func modelLimitEntry(t *testing.T, accountID int64, scope string) map[string]any {
++	t.Helper()
++	var raw []byte
++	require.NoError(t, integrationDB.QueryRowContext(context.Background(),
++		`SELECT COALESCE(extra->'model_rate_limits'->$1, 'null'::jsonb) FROM accounts WHERE id = $2`, scope, accountID).Scan(&raw))
++	var entry map[string]any
++	require.NoError(t, json.Unmarshal(raw, &entry))
++	return entry
++}
++
++func TestModelTracePauseKeepsAndRestoresOtherLimit(t *testing.T) {
++	ctx := context.Background()
++	repo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
++	account := mustCreateAccount(t, integrationEntClient, &service.Account{Name: "limit-preserve-" + time.Now().Format("150405.000000"), Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey})
++	const scope = "gpt-6-luna"
++	const reason = service.ModelTraceRateLimitReason
++
++	cooldownUntil := time.Now().Add(30 * time.Minute).UTC().Truncate(time.Second)
++	require.NoError(t, repo.SetModelRateLimit(ctx, account.ID, scope, cooldownUntil, "upstream_model_access_changed"))
++
++	require.NoError(t, repo.SetModelRateLimitPreservingOther(ctx, account.ID, scope, time.Now().Add(24*time.Hour), reason))
++	entry := modelLimitEntry(t, account.ID, scope)
++	require.Equal(t, reason, entry["reason"])
++	preserved := entry["preserved"].(map[string]any)
++	require.Equal(t, "upstream_model_access_changed", preserved["reason"])
++	require.Equal(t, cooldownUntil.Format(time.RFC3339), preserved["rate_limit_reset_at"])
++
++	// A repeated pause keeps what was preserved instead of preserving itself.
++	require.NoError(t, repo.SetModelRateLimitPreservingOther(ctx, account.ID, scope, time.Now().Add(25*time.Hour), reason))
++	entry = modelLimitEntry(t, account.ID, scope)
++	require.Equal(t, "upstream_model_access_changed", entry["preserved"].(map[string]any)["reason"])
++
++	cleared, err := repo.ClearModelRateLimitScopeIfReason(ctx, account.ID, scope, reason)
++	require.NoError(t, err)
++	require.True(t, cleared)
++	entry = modelLimitEntry(t, account.ID, scope)
++	require.Equal(t, "upstream_model_access_changed", entry["reason"], "the cooldown is still active, so it comes back")
++	require.Equal(t, cooldownUntil.Format(time.RFC3339), entry["rate_limit_reset_at"])
++
++	// The restored cooldown carries another reason, so a second resume leaves it alone.
++	cleared, err = repo.ClearModelRateLimitScopeIfReason(ctx, account.ID, scope, reason)
++	require.NoError(t, err)
++	require.False(t, cleared)
++}
++
++func TestModelTracePauseDropsExpiredOtherLimit(t *testing.T) {
++	ctx := context.Background()
++	repo := newAccountRepositoryWithSQL(integrationEntClient, integrationDB, nil)
++	account := mustCreateAccount(t, integrationEntClient, &service.Account{Name: "limit-expired-" + time.Now().Format("150405.000000"), Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey})
++	const scope = "gpt-6-astra"
++
++	require.NoError(t, repo.SetModelRateLimit(ctx, account.ID, scope, time.Now().Add(-time.Minute), "upstream_404_model_not_found"))
++	require.NoError(t, repo.SetModelRateLimitPreservingOther(ctx, account.ID, scope, time.Now().Add(time.Hour), service.ModelTraceRateLimitReason))
++	entry := modelLimitEntry(t, account.ID, scope)
++	require.NotContains(t, entry, "preserved", "an expired limit is not worth keeping")
++
++	cleared, err := repo.ClearModelRateLimitScopeIfReason(ctx, account.ID, scope, service.ModelTraceRateLimitReason)
++	require.NoError(t, err)
++	require.True(t, cleared)
++	require.Nil(t, modelLimitEntry(t, account.ID, scope))
++}
 diff --git a/backend/internal/repository/account_repo.go b/backend/internal/repository/account_repo.go
-index 781928aea..531beee96 100644
+index 781928aea..39ba6479e 100644
 --- a/backend/internal/repository/account_repo.go
 +++ b/backend/internal/repository/account_repo.go
 @@ -2432,7 +2432,7 @@ func (r *accountRepository) SetModelRateLimit(ctx context.Context, id int64, sco
@@ -2675,10 +2954,69 @@ index 781928aea..531beee96 100644
  			extra = jsonb_set(
  				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
  				ARRAY['model_rate_limits', $1]::text[],
-@@ -2635,6 +2635,46 @@ func (r *accountRepository) ClearModelRateLimits(ctx context.Context, id int64)
+@@ -2635,6 +2635,110 @@ func (r *accountRepository) ClearModelRateLimits(ctx context.Context, id int64)
  	return nil
  }
  
++// SetModelRateLimitPreservingOther sets a model limit with the given reason. An
++// active limit for the same scope with a different reason is kept under
++// "preserved" (timestamps are RFC3339 UTC, so text comparison orders them), so
++// clearing this reason later restores it instead of lifting it early. The read
++// and write happen in one statement.
++func (r *accountRepository) SetModelRateLimitPreservingOther(ctx context.Context, id int64, scope string, resetAt time.Time, reason string) error {
++	if strings.TrimSpace(scope) == "" || strings.TrimSpace(reason) == "" {
++		return nil
++	}
++	now := time.Now().UTC()
++	raw, err := json.Marshal(map[string]string{
++		"rate_limited_at":     now.Format(time.RFC3339),
++		"rate_limit_reset_at": resetAt.UTC().Format(time.RFC3339),
++		"reason":              reason,
++	})
++	if err != nil {
++		return err
++	}
++	client := clientFromContext(ctx, r.client)
++	result, err := client.ExecContext(
++		ctx,
++		`UPDATE accounts SET
++			extra = jsonb_set(
++				jsonb_set(COALESCE(extra, '{}'::jsonb), '{model_rate_limits}'::text[], COALESCE(extra->'model_rate_limits', '{}'::jsonb), true),
++				ARRAY['model_rate_limits', $1]::text[],
++				$2::jsonb || CASE
++					WHEN extra->'model_rate_limits'->$1->>'reason' IS DISTINCT FROM $4
++					 AND extra->'model_rate_limits'->$1->>'rate_limit_reset_at' > $5
++						THEN jsonb_build_object('preserved', (extra->'model_rate_limits'->$1) - 'preserved')
++					WHEN extra->'model_rate_limits'->$1->>'reason' = $4
++					 AND extra->'model_rate_limits'->$1->'preserved'->>'rate_limit_reset_at' > $5
++						THEN jsonb_build_object('preserved', extra->'model_rate_limits'->$1->'preserved')
++					ELSE '{}'::jsonb
++				END,
++				true
++			),
++			updated_at = NOW()
++		WHERE id = $3 AND deleted_at IS NULL`,
++		scope, raw, id, reason, now.Format(time.RFC3339),
++	)
++	if err != nil {
++		return err
++	}
++	affected, err := result.RowsAffected()
++	if err != nil {
++		return err
++	}
++	if affected == 0 {
++		return service.ErrAccountNotFound
++	}
++	if err := enqueueSchedulerOutbox(ctx, r.sql, service.SchedulerOutboxEventAccountChanged, &id, nil, nil); err != nil {
++		logger.LegacyPrintf("repository.account", "[SchedulerOutbox] enqueue model rate limit failed: account=%d err=%v", id, err)
++	}
++	r.syncSchedulerAccountSnapshot(ctx, id)
++	return nil
++}
++
++// ClearModelRateLimitScopeIfReason lifts a model limit only if it carries the
++// given reason. A still-active limit preserved underneath it is restored.
 +func (r *accountRepository) ClearModelRateLimitScopeIfReason(ctx context.Context, id int64, scope, reason string) (bool, error) {
 +	if strings.TrimSpace(scope) == "" || strings.TrimSpace(reason) == "" {
 +		return false, nil
@@ -2690,7 +3028,11 @@ index 781928aea..531beee96 100644
 +			extra = jsonb_set(
 +				COALESCE(extra, '{}'::jsonb),
 +				'{model_rate_limits}'::text[],
-+				(COALESCE(extra->'model_rate_limits', '{}'::jsonb) - $1::text),
++				CASE
++					WHEN extra->'model_rate_limits'->$1->'preserved'->>'rate_limit_reset_at' > $4
++						THEN jsonb_set(COALESCE(extra->'model_rate_limits', '{}'::jsonb), ARRAY[$1]::text[], extra->'model_rate_limits'->$1->'preserved', true)
++					ELSE COALESCE(extra->'model_rate_limits', '{}'::jsonb) - $1::text
++				END,
 +				true
 +			),
 +			updated_at = NOW()
@@ -2700,6 +3042,7 @@ index 781928aea..531beee96 100644
 +		scope,
 +		id,
 +		reason,
++		time.Now().UTC().Format(time.RFC3339),
 +	)
 +	if err != nil {
 +		return false, err
@@ -2724,7 +3067,7 @@ index 781928aea..531beee96 100644
  		Where(dbaccount.IDEQ(id)).
 diff --git a/backend/internal/repository/account_repo_clear_model_rate_limit_scope_test.go b/backend/internal/repository/account_repo_clear_model_rate_limit_scope_test.go
 new file mode 100644
-index 000000000..8238dbc90
+index 000000000..b49119c74
 --- /dev/null
 +++ b/backend/internal/repository/account_repo_clear_model_rate_limit_scope_test.go
 @@ -0,0 +1,93 @@
@@ -2761,7 +3104,7 @@ index 000000000..8238dbc90
 +	reason := "modeltrace_suspect"
 +
 +	mock.ExpectExec(regexp.QuoteMeta("UPDATE accounts SET")).
-+		WithArgs(scope, accountID, reason).
++		WithArgs(scope, accountID, reason, sqlmock.AnyArg()).
 +		WillReturnResult(sqlmock.NewResult(1, 1))
 +
 +	mock.ExpectExec(regexp.QuoteMeta("INSERT INTO scheduler_outbox")).
@@ -2790,7 +3133,7 @@ index 000000000..8238dbc90
 +	reason := "modeltrace_suspect"
 +
 +	mock.ExpectExec(regexp.QuoteMeta("UPDATE accounts SET")).
-+		WithArgs(scope, accountID, reason).
++		WithArgs(scope, accountID, reason, sqlmock.AnyArg()).
 +		WillReturnResult(sqlmock.NewResult(0, 0))
 +
 +	repo := newAccountRepositoryWithSQL(client, db, nil)
@@ -2822,10 +3165,19 @@ index 000000000..8238dbc90
 +	require.NoError(t, mock.ExpectationsWereMet())
 +}
 diff --git a/backend/internal/server/router.go b/backend/internal/server/router.go
-index c7ac7748e..6266baf9f 100644
+index c7ac7748e..0792b10ac 100644
 --- a/backend/internal/server/router.go
 +++ b/backend/internal/server/router.go
-@@ -128,6 +128,7 @@ func registerRoutes(
+@@ -57,6 +57,8 @@ func SetupRouter(
+ 
+ 	// 应用中间件
+ 	r.Use(middleware2.RequestLogger())
++	// Strip ModelTrace probe headers on every route before any handler can forward them.
++	r.Use(service.ModelTraceProbeHeaderMiddleware())
+ 	// 将客户端 IP + UA 注入 request context，供 token 签发/会话绑定/审计日志统一读取。
+ 	// 解析模式按请求快照：兼容开关开启时信任原始转发头，关闭时使用 server.trusted_proxies。
+ 	r.Use(middleware2.SessionBindingContext(cfg))
+@@ -128,6 +130,7 @@ func registerRoutes(
  	routes.RegisterUserRoutes(v1, h, jwtAuth, auditLog, settingService, panelRateLimiter)
  	routes.RegisterModelPlazaRoutes(v1, h, optionalJWTAuth, settingService, panelRateLimiter)
  	routes.RegisterAdminRoutes(v1, h, adminAuth, auditLog, stepUpAuth, settingService, panelRateLimiter)
@@ -3340,12 +3692,419 @@ index 53bd3d8cc..c9fa68754 100644
  	return context.WithoutCancel(ctx), func() {}
  }
  
+diff --git a/backend/internal/service/modeltrace_accounts_inactive_test.go b/backend/internal/service/modeltrace_accounts_inactive_test.go
+new file mode 100644
+index 000000000..28e6b8977
+--- /dev/null
++++ b/backend/internal/service/modeltrace_accounts_inactive_test.go
+@@ -0,0 +1,81 @@
++package service
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/DATA-DOG/go-sqlmock"
++	"github.com/stretchr/testify/require"
++)
++
++func TestModelTraceInactiveReason(t *testing.T) {
++	now := time.Now()
++	later := now.Add(time.Hour)
++	earlier := now.Add(-time.Hour)
++	cases := []struct {
++		name string
++		acc  Account
++		want string
++	}{
++		{"pool", Account{Status: StatusActive, Schedulable: true}, ""},
++		{"expired windows", Account{Status: StatusActive, Schedulable: true, RateLimitResetAt: &earlier, TempUnschedulableUntil: &earlier}, ""},
++		{"manual off", Account{Status: StatusActive, Schedulable: false}, "unschedulable"},
++		{"rate limited", Account{Status: StatusActive, Schedulable: true, RateLimitResetAt: &later}, "rate_limited"},
++		{"temp", Account{Status: StatusActive, Schedulable: true, TempUnschedulableUntil: &later}, "temp_unschedulable"},
++		{"error", Account{Status: StatusError, Schedulable: true}, "error"},
++		{"disabled", Account{Status: "disabled", Schedulable: true}, "disabled"},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			require.Equal(t, tc.want, modelTraceInactiveReason(&tc.acc, now))
++		})
++	}
++}
++
++func TestModelTraceAccountsService_IncludeInactive(t *testing.T) {
++	later := time.Now().Add(time.Hour)
++	mapping := map[string]any{"model_mapping": map[string]any{"gpt-4o": "gpt-4o"}}
++	repo := &mockAccountRepoForModelTrace{accounts: []Account{
++		{ID: 1, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, Credentials: mapping},
++		{ID: 2, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: false, Credentials: mapping},
++		{ID: 3, Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, RateLimitResetAt: &later, Credentials: mapping},
++		{ID: 4, Platform: PlatformAnthropic, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: false, Credentials: mapping},
++	}}
++
++	expectStats := func(mock sqlmock.Sqlmock) {
++		mock.ExpectQuery("SELECT account_id, COUNT\\(\\*\\) FILTER .* FROM usage_logs").
++			WillReturnRows(sqlmock.NewRows([]string{"account_id", "requests_10m", "last_request_at", "last_model"}))
++		mock.ExpectQuery("SELECT account_id, model, COUNT\\(\\*\\) as req_count FROM usage_logs").
++			WillReturnRows(sqlmock.NewRows([]string{"account_id", "model", "req_count"}))
++	}
++
++	db, mock, err := sqlmock.New()
++	require.NoError(t, err)
++	defer db.Close()
++	expectStats(mock)
++	resp, err := NewModelTraceAccountsService(repo, db).GetAccounts(context.Background(), []string{"gpt-4o"}, true)
++	require.NoError(t, err)
++	require.Len(t, resp.Accounts, 3, "non-OpenAI accounts stay out")
++	got := map[int64]ModelTraceAccountActivity{}
++	for _, a := range resp.Accounts {
++		got[a.AccountID] = a
++	}
++	require.True(t, got[1].Schedulable)
++	require.Empty(t, got[1].InactiveReason)
++	require.False(t, got[2].Schedulable)
++	require.Equal(t, "unschedulable", got[2].InactiveReason)
++	require.False(t, got[3].Schedulable)
++	require.Equal(t, "rate_limited", got[3].InactiveReason)
++
++	// Without the opt-in the pool query is unchanged and no reason is emitted.
++	db2, mock2, err := sqlmock.New()
++	require.NoError(t, err)
++	defer db2.Close()
++	expectStats(mock2)
++	resp, err = NewModelTraceAccountsService(repo, db2).GetSchedulableAccounts(context.Background(), []string{"gpt-4o"})
++	require.NoError(t, err)
++	for _, a := range resp.Accounts {
++		require.Empty(t, a.InactiveReason)
++	}
++}
+diff --git a/backend/internal/service/modeltrace_accounts_model_sync_test.go b/backend/internal/service/modeltrace_accounts_model_sync_test.go
+new file mode 100644
+index 000000000..44499438d
+--- /dev/null
++++ b/backend/internal/service/modeltrace_accounts_model_sync_test.go
+@@ -0,0 +1,314 @@
++package service
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/DATA-DOG/go-sqlmock"
++	"github.com/stretchr/testify/require"
++)
++
++// These are account capabilities, not a claim that ModelTrace has a calibrated
++// probe for every model. The caller supplies the models it can actually probe.
++func modelTraceSyncWhitelist(models ...string) map[string]any {
++	mapping := make(map[string]any, len(models))
++	for _, model := range models {
++		mapping[model] = model
++	}
++	return mapping
++}
++
++func expectModelTraceSyncActivity(mock sqlmock.Sqlmock) {
++	// Recent traffic for one model must not narrow the saved capability list.
++	mock.ExpectQuery("SELECT account_id, COUNT\\(\\*\\) FILTER .* FROM usage_logs").
++		WithArgs("{42}", sqlmock.AnyArg(), sqlmock.AnyArg()).
++		WillReturnRows(sqlmock.NewRows([]string{"account_id", "requests_10m", "last_request_at", "last_model"}).
++			AddRow(42, 1, time.Now().Add(-time.Minute), "gpt-6-astra"))
++	mock.ExpectQuery("SELECT account_id, model, COUNT\\(\\*\\) as req_count FROM usage_logs").
++		WithArgs("{42}", sqlmock.AnyArg()).
++		WillReturnRows(sqlmock.NewRows([]string{"account_id", "model", "req_count"}).
++			AddRow(42, "gpt-6-astra", 1))
++}
++
++func TestModelTraceAccountsService_ModelListSync(t *testing.T) {
++	sevenModels := []string{
++		"codex-auto-review", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol",
++		"gpt-5.6-terra", "gpt-6-astra", "gpt-reserve",
++	}
++	tests := []struct {
++		name      string
++		mapping   map[string]any
++		requested []string
++		want      []string
++	}{
++		{
++			name:      "stored astra only is not expanded to UI defaults",
++			mapping:   modelTraceSyncWhitelist("gpt-6-astra"),
++			requested: sevenModels,
++			want:      []string{"gpt-6-astra"},
++		},
++		{
++			name:      "all seven saved whitelist entries survive a matching request",
++			mapping:   modelTraceSyncWhitelist(sevenModels...),
++			requested: sevenModels,
++			want:      sevenModels,
++		},
++		{
++			name:      "caller probe filter is not replaced by the saved whitelist",
++			mapping:   modelTraceSyncWhitelist(sevenModels...),
++			requested: []string{"gpt-6-astra"},
++			want:      []string{"gpt-6-astra"},
++		},
++		{
++			name:      "request order and public mapping keys are preserved",
++			mapping:   map[string]any{"gpt-6-astra": "private-astra", "gpt-5.6-sol": "private-sol"},
++			requested: []string{" gpt-5.6-sol ", "private-sol", "", "gpt-6-astra", "private-astra"},
++			want:      []string{"gpt-5.6-sol", "gpt-6-astra"},
++		},
++		{
++			name:      "wildcard mappings expand only caller supplied concrete models",
++			mapping:   map[string]any{"gpt-5.6-*": "upstream-model"},
++			requested: []string{"gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra", "upstream-model"},
++			want:      []string{"gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra"},
++		},
++		{
++			name:      "empty mapping allows caller candidates without injecting defaults",
++			mapping:   map[string]any{},
++			requested: []string{"gpt-6-astra", "gpt-5.6-sol"},
++			want:      []string{"gpt-6-astra", "gpt-5.6-sol"},
++		},
++		{
++			name:      "no supported intersection does not query activity",
++			mapping:   modelTraceSyncWhitelist("gpt-6-astra"),
++			requested: []string{"gpt-5.6-sol"},
++		},
++		{
++			name:    "missing model filter is not implicit capability discovery",
++			mapping: modelTraceSyncWhitelist(sevenModels...),
++		},
++		{
++			name:      "blank model filter is not implicit capability discovery",
++			mapping:   modelTraceSyncWhitelist(sevenModels...),
++			requested: []string{"", " "},
++		},
++	}
++
++	for _, accountType := range []string{AccountTypeAPIKey, AccountTypeOAuth} {
++		t.Run(accountType, func(t *testing.T) {
++			for _, tc := range tests {
++				t.Run(tc.name, func(t *testing.T) {
++					t.Setenv("MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS", "")
++					db, mock, err := sqlmock.New()
++					require.NoError(t, err)
++					t.Cleanup(func() { _ = db.Close() })
++					repo := &mockAccountRepoForModelTrace{accounts: []Account{{
++						ID: 42, Name: "231", Platform: PlatformOpenAI, Type: accountType,
++						Status: StatusActive, Schedulable: true,
++						Credentials: map[string]any{"model_mapping": tc.mapping},
++					}}}
++					if len(tc.want) > 0 {
++						expectModelTraceSyncActivity(mock)
++					}
++					resp, err := NewModelTraceAccountsService(repo, db).GetAccounts(context.Background(), tc.requested, true)
++					require.NoError(t, err)
++					if len(tc.want) == 0 {
++						require.Empty(t, resp.Accounts)
++					} else {
++						require.Len(t, resp.Accounts, 1)
++						require.Equal(t, int64(42), resp.Accounts[0].AccountID)
++						require.Equal(t, "231", resp.Accounts[0].Name)
++						require.Equal(t, tc.want, resp.Accounts[0].Models)
++						require.Equal(t, []string{"gpt-6-astra"}, resp.Accounts[0].RealModels10m)
++					}
++					require.NoError(t, mock.ExpectationsWereMet())
++				})
++			}
++		})
++	}
++}
++
++func TestModelTraceAccountsService_ModelListSyncAfterSavedMappingChanges(t *testing.T) {
++	t.Setenv("MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS", "")
++	db, mock, err := sqlmock.New()
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = db.Close() })
++
++	raw := modelTraceSyncWhitelist("gpt-6-astra")
++	repo := &mockAccountRepoForModelTrace{accounts: []Account{{
++		ID: 42, Name: "231", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
++		Status: StatusActive, Schedulable: true,
++		Credentials: map[string]any{"model_mapping": raw},
++	}}}
++	svc := NewModelTraceAccountsService(repo, db)
++	requested := []string{"gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-luna"}
++	check := func(want []string) {
++		t.Helper()
++		expectModelTraceSyncActivity(mock)
++		resp, err := svc.GetAccounts(context.Background(), requested, true)
++		require.NoError(t, err)
++		require.Len(t, resp.Accounts, 1)
++		require.Equal(t, want, resp.Accounts[0].Models)
++		require.NoError(t, mock.ExpectationsWereMet())
++	}
++
++	// Simulate a repository returning an account with a populated mapping cache.
++	require.Equal(t, map[string]string{"gpt-6-astra": "gpt-6-astra"}, repo.accounts[0].GetModelMapping())
++	check([]string{"gpt-6-astra"})
++
++	// Same credentials/map pointer and same entry count: content changes still
++	// invalidate the signature, rather than freezing the first model forever.
++	delete(raw, "gpt-6-astra")
++	raw["gpt-5.6-sol"] = "private-sol"
++	check([]string{"gpt-5.6-sol"})
++
++	// Replacing the mapping after an account edit must be visible on next read.
++	repo.accounts[0].Credentials["model_mapping"] = modelTraceSyncWhitelist(requested...)
++	check(requested)
++
++	// Removed models must disappear too; a previous response is not a union.
++	repo.accounts[0].Credentials = map[string]any{"model_mapping": modelTraceSyncWhitelist("gpt-5.6-luna")}
++	check([]string{"gpt-5.6-luna"})
++}
++
++// Repository boundary without network access: reads are copies, so tests cannot
++// accidentally treat a mutation of a loaded account as a successful DB write.
++type modelTraceModelSyncRepo struct {
++	mockAccountRepoForModelTrace
++	accountWrites int
++	extraWrites   int
++}
++
++func (r *modelTraceModelSyncRepo) GetByID(_ context.Context, id int64) (*Account, error) {
++	for _, stored := range r.accounts {
++		if stored.ID != id {
++			continue
++		}
++		acc := stored
++		var err error
++		acc.Credentials, err = cloneAccountJSONMap(stored.Credentials)
++		if err != nil {
++			return nil, err
++		}
++		acc.Extra, err = cloneAccountJSONMap(stored.Extra)
++		return &acc, err
++	}
++	return nil, ErrAccountNotFound
++}
++
++func (r *modelTraceModelSyncRepo) Update(_ context.Context, account *Account) error {
++	for i := range r.accounts {
++		if r.accounts[i].ID == account.ID {
++			r.accounts[i] = *account
++			r.accountWrites++
++			return nil
++		}
++	}
++	return ErrAccountNotFound
++}
++
++func (r *modelTraceModelSyncRepo) UpdateExtra(_ context.Context, id int64, updates map[string]any) error {
++	for i := range r.accounts {
++		if r.accounts[i].ID == id {
++			if r.accounts[i].Extra == nil {
++				r.accounts[i].Extra = make(map[string]any)
++			}
++			for key, value := range updates {
++				r.accounts[i].Extra[key] = value
++			}
++			r.extraWrites++
++			return nil
++		}
++	}
++	return ErrAccountNotFound
++}
++
++func TestModelTraceAccountsService_ModelListSyncDiscoveryThenSave(t *testing.T) {
++	t.Setenv("MODELTRACE_ACTIVITY_EXCLUDE_KEY_IDS", "")
++	ctx := context.Background()
++	sevenModels := []string{
++		"codex-auto-review", "gpt-5.5", "gpt-5.6-luna", "gpt-5.6-sol",
++		"gpt-5.6-terra", "gpt-6-astra", "gpt-reserve",
++	}
++	repo := &modelTraceModelSyncRepo{mockAccountRepoForModelTrace: mockAccountRepoForModelTrace{accounts: []Account{{
++		ID: 42, Name: "231", Platform: PlatformOpenAI, Type: AccountTypeAPIKey,
++		Status: StatusActive, Schedulable: true,
++		Credentials: map[string]any{
++			"api_key": "test-key", "base_url": "https://provider.example/v1",
++			"model_mapping": modelTraceSyncWhitelist("gpt-6-astra"),
++		},
++	}}}}
++
++	// Deterministic complete upstream metadata avoids a registry HTTP fallback.
++	// These fixture capabilities do not declare calibrated ModelTrace probes.
++	var models []map[string]any
++	for _, model := range sevenModels {
++		models = append(models, map[string]any{
++			"slug": model, "display_name": model,
++			"supported_reasoning_levels": []map[string]string{{"effort": "low"}},
++			"input_modalities":           []string{"text"}, "context_window": 128000,
++		})
++	}
++	body, err := json.Marshal(map[string]any{"models": models})
++	require.NoError(t, err)
++	upstream := &httpUpstreamRecorder{resp: &http.Response{
++		StatusCode: http.StatusOK,
++		Header:     http.Header{"Content-Type": []string{"application/json"}},
++		Body:       io.NopCloser(strings.NewReader(string(body))),
++	}}
++	catalogService := &AccountTestService{accountRepo: repo, httpUpstream: upstream, cfg: upstreamModelSyncTestConfig()}
++	loaded, err := repo.GetByID(ctx, 42)
++	require.NoError(t, err)
++	catalog, err := catalogService.SyncUpstreamModelCatalog(ctx, loaded)
++	require.NoError(t, err)
++	require.ElementsMatch(t, sevenModels, catalog.Models)
++	require.Len(t, upstream.requests, 1)
++	require.Equal(t, 1, repo.extraWrites, "sync-upstream persists capability metadata only")
++	require.Zero(t, repo.accountWrites, "discovery must not silently widen routing permissions")
++	stored, err := repo.GetByID(ctx, 42)
++	require.NoError(t, err)
++	require.Equal(t, modelTraceSyncWhitelist("gpt-6-astra"), stored.Credentials["model_mapping"])
++	require.NotNil(t, stored.GetUpstreamModelMetadataSnapshot())
++
++	db, mock, err := sqlmock.New()
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = db.Close() })
++	modelTrace := NewModelTraceAccountsService(repo, db)
++	check := func(want []string) {
++		t.Helper()
++		expectModelTraceSyncActivity(mock)
++		resp, err := modelTrace.GetAccounts(ctx, sevenModels, true)
++		require.NoError(t, err)
++		require.Len(t, resp.Accounts, 1)
++		require.Equal(t, want, resp.Accounts[0].Models)
++		require.NoError(t, mock.ExpectationsWereMet())
++	}
++	check([]string{"gpt-6-astra"})
++
++	// Actual admin service update: redacted PUT omits the API key, but the
++	// non-sensitive model_mapping is replaced, not merged with an old whitelist.
++	admin := &adminServiceImpl{accountRepo: repo}
++	updated, err := admin.UpdateAccount(ctx, 42, &UpdateAccountInput{Credentials: map[string]any{
++		"base_url": "https://provider.example/v1", "model_mapping": modelTraceSyncWhitelist(sevenModels...),
++	}})
++	require.NoError(t, err)
++	require.Equal(t, 1, repo.accountWrites)
++	require.Equal(t, "test-key", updated.Credentials["api_key"])
++	require.Equal(t, modelTraceSyncWhitelist(sevenModels...), updated.Credentials["model_mapping"])
++	check(sevenModels) // no timer, worker, or cache invalidation needed on the host
++
++	detail, err := admin.GetAccount(ctx, 42)
++	require.NoError(t, err)
++	require.Equal(t, modelTraceSyncWhitelist(sevenModels...), detail.Credentials["model_mapping"])
++
++	_, err = admin.UpdateAccount(ctx, 42, &UpdateAccountInput{Credentials: map[string]any{
++		"base_url": "https://provider.example/v1", "model_mapping": modelTraceSyncWhitelist("gpt-5.6-sol"),
++	}})
++	require.NoError(t, err)
++	require.Equal(t, 2, repo.accountWrites)
++	check([]string{"gpt-5.6-sol"})
++}
 diff --git a/backend/internal/service/modeltrace_accounts_service.go b/backend/internal/service/modeltrace_accounts_service.go
 new file mode 100644
-index 000000000..f3aef7062
+index 000000000..465503672
 --- /dev/null
 +++ b/backend/internal/service/modeltrace_accounts_service.go
-@@ -0,0 +1,476 @@
+@@ -0,0 +1,527 @@
 +package service
 +
 +import (
@@ -3386,13 +4145,22 @@ index 000000000..f3aef7062
 +	ClearModelRateLimitScopeIfReason(ctx context.Context, id int64, scope, reason string) (bool, error)
 +}
 +
++// modelRateLimitPreserver sets a model limit without discarding a still-active
++// limit that another component (e.g. an upstream 403/404 cooldown) placed there.
++type modelRateLimitPreserver interface {
++	SetModelRateLimitPreservingOther(ctx context.Context, id int64, scope string, resetAt time.Time, reason string) error
++}
++
 +// ModelTraceAccountActivity represents the detection candidate account returned to ModelTrace.
 +type ModelTraceAccountActivity struct {
-+	AccountID         int64                   `json:"account_id"`
-+	Name              string                  `json:"name"`
-+	Platform          string                  `json:"platform"`
-+	Type              string                  `json:"type"`
-+	Schedulable       bool                    `json:"schedulable"`
++	AccountID   int64  `json:"account_id"`
++	Name        string `json:"name"`
++	Platform    string `json:"platform"`
++	Type        string `json:"type"`
++	Schedulable bool   `json:"schedulable"`
++	// InactiveReason is only set for accounts returned via include_inactive:
++	// they still exist on the host but are not in the scheduling pool.
++	InactiveReason    string                  `json:"inactive_reason,omitempty"`
 +	Models            []string                `json:"models"`
 +	PausedModels      []ModelTracePausedModel `json:"paused_models"`
 +	ClusterID         *string                 `json:"cluster_id"`
@@ -3461,14 +4229,46 @@ index 000000000..f3aef7062
 +
 +// GetSchedulableAccounts returns accounts matching query models and their real activity stats.
 +func (s *ModelTraceAccountsService) GetSchedulableAccounts(ctx context.Context, requestedModels []string) (*ModelTraceAccountsResponse, error) {
++	return s.GetAccounts(ctx, requestedModels, false)
++}
++
++// modelTraceInactiveReason mirrors the StatusActive list filter: an empty
++// result means the account is in the scheduling pool the detector may probe.
++func modelTraceInactiveReason(acc *Account, now time.Time) string {
++	switch {
++	case acc.Status != StatusActive:
++		if acc.Status == StatusError {
++			return "error"
++		}
++		return "disabled"
++	case !acc.Schedulable:
++		return "unschedulable"
++	case acc.RateLimitResetAt != nil && now.Before(*acc.RateLimitResetAt):
++		return "rate_limited"
++	case acc.TempUnschedulableUntil != nil && now.Before(*acc.TempUnschedulableUntil):
++		return "temp_unschedulable"
++	}
++	return ""
++}
++
++// GetAccounts returns matching accounts. With includeInactive, accounts that
++// exist but are outside the scheduling pool are returned too, marked
++// schedulable=false with a reason, so the detector can keep showing their
++// last result instead of forgetting them. Old detectors never ask for them.
++func (s *ModelTraceAccountsService) GetAccounts(ctx context.Context, requestedModels []string, includeInactive bool) (*ModelTraceAccountsResponse, error) {
 +	now := time.Now()
 +	resp := &ModelTraceAccountsResponse{
 +		GeneratedAt: now,
 +		Accounts:    []ModelTraceAccountActivity{},
 +	}
 +
-+	// 1. Query all active accounts (deleted_at is nil, status = 'active')
-+	accounts, err := s.accountRepo.ListAllWithFilters(ctx, "", "", StatusActive, "", 0, "")
++	// 1. Query active accounts (deleted_at is nil, status = 'active'), or every
++	// non-deleted account when inactive ones are requested.
++	statusFilter := StatusActive
++	if includeInactive {
++		statusFilter = ""
++	}
++	accounts, err := s.accountRepo.ListAllWithFilters(ctx, "", "", statusFilter, "", 0, "")
 +	if err != nil {
 +		return nil, err
 +	}
@@ -3526,17 +4326,22 @@ index 000000000..f3aef7062
 +
 +		pausedModels := modelTracePausedByRequestedModel(acc, item.models, ExtractModelTracePausedModels(acc.Extra, now))
 +
++		inactiveReason := ""
++		if includeInactive {
++			inactiveReason = modelTraceInactiveReason(acc, now)
++		}
 +		act := ModelTraceAccountActivity{
-+			AccountID:     acc.ID,
-+			Name:          acc.Name,
-+			Platform:      acc.Platform,
-+			Type:          acc.Type,
-+			Schedulable:   acc.Schedulable,
-+			Models:        item.models,
-+			PausedModels:  pausedModels,
-+			ClusterID:     clusterID,
-+			ClusterName:   clusterName,
-+			RealModels10m: realModels,
++			AccountID:      acc.ID,
++			Name:           acc.Name,
++			Platform:       acc.Platform,
++			Type:           acc.Type,
++			Schedulable:    acc.Schedulable && inactiveReason == "",
++			InactiveReason: inactiveReason,
++			Models:         item.models,
++			PausedModels:   pausedModels,
++			ClusterID:      clusterID,
++			ClusterName:    clusterName,
++			RealModels10m:  realModels,
 +		}
 +		if st != nil {
 +			act.RealRequests10m = st.requests10m
@@ -3778,7 +4583,12 @@ index 000000000..f3aef7062
 +		}, nil
 +	}
 +
-+	if err := s.accountRepo.SetModelRateLimit(ctx, accountID, scope, newResetAt, ModelTraceRateLimitReason); err != nil {
++	if preserver, ok := s.accountRepo.(modelRateLimitPreserver); ok {
++		err = preserver.SetModelRateLimitPreservingOther(ctx, accountID, scope, newResetAt, ModelTraceRateLimitReason)
++	} else {
++		err = s.accountRepo.SetModelRateLimit(ctx, accountID, scope, newResetAt, ModelTraceRateLimitReason)
++	}
++	if err != nil {
 +		return nil, err
 +	}
 +
@@ -4058,12 +4868,64 @@ index 000000000..376e18fe0
 +		{Model: "unrelated-scope", Until: "2026-09-25T02:00:00Z"},
 +	}, got)
 +}
+diff --git a/backend/internal/service/modeltrace_probe_middleware_test.go b/backend/internal/service/modeltrace_probe_middleware_test.go
+new file mode 100644
+index 000000000..d7e9d7c34
+--- /dev/null
++++ b/backend/internal/service/modeltrace_probe_middleware_test.go
+@@ -0,0 +1,46 @@
++package service
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestModelTraceProbeHeaderMiddlewareStripsOnEveryRoute(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	t.Setenv(ModelTraceSecretEnv, "probe-secret")
++	for _, tc := range []struct {
++		name   string
++		secret string
++		active bool
++	}{{"valid", "probe-secret", true}, {"wrong", "guess", false}} {
++		t.Run(tc.name, func(t *testing.T) {
++			engine := gin.New()
++			engine.Use(ModelTraceProbeHeaderMiddleware())
++			var seen http.Header
++			var routing ModelTraceProbeRouting
++			// A handler that never looks at probe routing (e.g. /v1/messages).
++			engine.POST("/v1/messages", func(c *gin.Context) {
++				seen = c.Request.Header.Clone()
++				routing = ExtractAndStripModelTraceProbeHeaders(c)
++				c.Status(http.StatusNoContent)
++			})
++			req := httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
++			req.Header.Set("x-modeltrace-probe", tc.secret)
++			req.Header.Set("X-ModelTrace-Account", "41")
++			engine.ServeHTTP(httptest.NewRecorder(), req)
++
++			require.NotNil(t, seen)
++			assert.Empty(t, seen.Get(ModelTraceProbeHeader), "the secret never reaches a handler")
++			assert.Empty(t, seen.Get(ModelTraceAccountHeader))
++			assert.Equal(t, tc.active, routing.Active, "handlers still get the verified routing")
++			if tc.active {
++				assert.Equal(t, int64(41), routing.AccountID)
++			}
++		})
++	}
++}
 diff --git a/backend/internal/service/modeltrace_probe_routing.go b/backend/internal/service/modeltrace_probe_routing.go
 new file mode 100644
-index 000000000..b9a6ffaba
+index 000000000..8a0a455f2
 --- /dev/null
 +++ b/backend/internal/service/modeltrace_probe_routing.go
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,225 @@
 +package service
 +
 +import (
@@ -4094,14 +4956,38 @@ index 000000000..b9a6ffaba
 +	AccountID int64
 +}
 +
++const modelTraceProbeRoutingContextKey = "modeltrace_probe_routing"
++
++// ModelTraceProbeHeaderMiddleware strips the probe headers from every request
++// before any handler runs, so no entry point can forward them upstream, and
++// keeps the verified routing for handlers that honor it.
++func ModelTraceProbeHeaderMiddleware() gin.HandlerFunc {
++	return func(c *gin.Context) {
++		ExtractAndStripModelTraceProbeHeaders(c)
++		c.Next()
++	}
++}
++
 +// ExtractAndStripModelTraceProbeHeaders extracts and deletes the probe routing headers from the request.
 +// If X-ModelTrace-Probe matches MODELTRACE_SECRET via constant-time comparison and X-ModelTrace-Account
 +// contains a valid account ID, it returns Active=true and the parsed AccountID.
 +// In all cases, both headers are deleted from c.Request.Header so they are never forwarded upstream.
++// The result is cached on the context: after the middleware ran, handlers read it from there.
 +func ExtractAndStripModelTraceProbeHeaders(c *gin.Context) ModelTraceProbeRouting {
 +	if c == nil || c.Request == nil {
 +		return ModelTraceProbeRouting{}
 +	}
++	if cached, ok := c.Get(modelTraceProbeRoutingContextKey); ok {
++		if routing, ok := cached.(ModelTraceProbeRouting); ok {
++			return routing
++		}
++	}
++	routing := extractModelTraceProbeHeaders(c)
++	c.Set(modelTraceProbeRoutingContextKey, routing)
++	return routing
++}
++
++func extractModelTraceProbeHeaders(c *gin.Context) ModelTraceProbeRouting {
 +
 +	var probeVal, accountVal string
 +	for key, values := range c.Request.Header {
@@ -5051,13 +5937,14 @@ index 31362723b..d16c74b43 100644
  	NewErrorPassthroughService,
 diff --git a/frontend/src/api/admin/__tests__/modelTrace.spec.ts b/frontend/src/api/admin/__tests__/modelTrace.spec.ts
 new file mode 100644
-index 000000000..bc26ca813
+index 000000000..1170545f8
 --- /dev/null
 +++ b/frontend/src/api/admin/__tests__/modelTrace.spec.ts
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,100 @@
 +import { describe, expect, it, vi, beforeEach } from 'vitest'
 +import { apiClient } from '../../client'
 +import { runAdminAccountTrace, getAdminAccountTraces, getAdminAccountTrace } from '../modelTrace'
++import { isOlderTraceSnapshot } from '../../modelTrace'
 +
 +vi.mock('../../client', () => ({
 +  apiClient: {
@@ -5072,7 +5959,7 @@ index 000000000..bc26ca813
 +  })
 +
 +  it('getAdminAccountTraces calls /admin/modeltrace/accounts', async () => {
-+    const mockData = { accounts: [] }
++    const mockData = { snapshot_at: '2026-09-25T00:00:00.123456+00:00', accounts: [] }
 +    vi.mocked(apiClient.get).mockResolvedValueOnce({ data: mockData })
 +
 +    const res = await getAdminAccountTraces()
@@ -5081,7 +5968,10 @@ index 000000000..bc26ca813
 +  })
 +
 +  it('getAdminAccountTrace calls /admin/modeltrace/accounts/:id', async () => {
-+    const mockAccount = { account_id: 17, name: 'acc-17' }
++    const mockAccount = { account_id: 17, name: 'acc-17', models: ['gpt-6-astra'],
++      snapshot_at: '2026-09-25T00:00:00.123456+00:00', schedule_mode: 'manual',
++      queued: true, running: false, queued_at: '2026-09-25T00:00:00Z',
++      available_at: '2026-09-25T00:00:05Z', started_at: null }
 +    vi.mocked(apiClient.get).mockResolvedValueOnce({ data: mockAccount })
 +
 +    const res = await getAdminAccountTrace(17)
@@ -5136,6 +6026,21 @@ index 000000000..bc26ca813
 +    await expect(runAdminAccountTrace(17)).rejects.toMatchObject(otherErr)
 +  })
 +})
++
++describe('trace read watermark ordering', () => {
++  it.each([
++    ['2026-09-25T00:00:00.123455Z', '2026-09-25T00:00:00.123456+00:00', true],
++    ['2026-09-25T00:00:00.123457Z', '2026-09-25T00:00:00.123456+00:00', false],
++    ['2026-09-25T08:00:00.123456+08:00', '2026-09-25T00:00:00.123456Z', false],
++    ['2026-09-25T00:00:00.999999Z', '2026-09-25T00:00:01Z', true],
++    ['2026-09-25T00:00:01Z', '2026-09-25T00:00:00.999999Z', false],
++    [undefined, '2026-09-25T00:00:00Z', true],
++    ['invalid', '2026-09-25T00:00:00Z', true],
++    ['2026-09-25T00:00:00Z', undefined, false],
++  ])('orders %s against %s without using probe timestamps', (incoming, current, older) => {
++    expect(isOlderTraceSnapshot(incoming, current)).toBe(older)
++  })
++})
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
 index 0616449f1..35a30280f 100644
 --- a/frontend/src/api/admin/index.ts
@@ -5170,12 +6075,12 @@ index 0616449f1..35a30280f 100644
  export default adminAPI
 diff --git a/frontend/src/api/admin/modelTrace.ts b/frontend/src/api/admin/modelTrace.ts
 new file mode 100644
-index 000000000..a543733f5
+index 000000000..f1e370ee6
 --- /dev/null
 +++ b/frontend/src/api/admin/modelTrace.ts
-@@ -0,0 +1,90 @@
+@@ -0,0 +1,115 @@
 +import { apiClient } from '../client'
-+import type { TraceCandidate } from '../modelTrace'
++import type { TraceCandidate, TraceSnapshotTiming } from '../modelTrace'
 +
 +export interface AccountTraceLatest {
 +  account_id?: number
@@ -5197,16 +6102,34 @@ index 000000000..a543733f5
 +  paused_until?: string | null
 +}
 +
-+export interface AccountTraceItem {
++/** One key of a target (a single account has exactly one). */
++export interface AccountTraceMember {
++  account_id: number
++  name: string
++  /** false: the key exists but is outside the host's scheduling pool. */
++  participating: boolean
++  inactive_reason?: string | null
++  models: string[]
++  latest_by_model: Record<string, AccountTraceLatest | null>
++}
++
++export interface AccountTraceItem extends TraceSnapshotTiming {
 +  account_id: number
 +  name: string
 +  cluster_id?: string | null
 +  cluster_name?: string | null
 +  member_account_ids?: number[]
++  /** Current probeable targets, not the set of models with historical results. */
 +  models: string[]
++  /** Actual pending/running job model; independent of historical results. */
 +  next_model?: string | null
++  /** May include history for models removed from the current target set. */
 +  per_model?: AccountTracePerModel[]
 +  mode: 'active' | 'idle' | string
++  /** false: no key of this target is in the scheduling pool; only last results are shown. */
++  participating?: boolean
++  inactive_reason?: string | null
++  members?: AccountTraceMember[]
 +  interval_seconds: number
 +  last_real_request_at: string | null
 +  next_run_at: string | null
@@ -5218,6 +6141,8 @@ index 000000000..a543733f5
 +}
 +
 +export interface AccountTraceListResponse {
++  /** Common DB read watermark, including for an empty account list. */
++  snapshot_at?: string
 +  accounts: AccountTraceItem[]
 +}
 +
@@ -5237,6 +6162,11 @@ index 000000000..a543733f5
 +    await apiClient.post(`/admin/modeltrace/accounts/${accountId}/run`, payload, { signal })
 +  } catch (err: any) {
 +    const errorKey = err?.error || err?.message
++    if (errorKey === 'not_participating' || err?.message_code === 'not_participating') {
++      const e = new Error('账号未参与调度，已停止探测')
++      Object.assign(e, err)
++      throw e
++    }
 +    if (err?.status === 400 || errorKey === 'model_not_supported') {
 +      const e = new Error('该模型不在此账号支持列表')
 +      Object.assign(e, err)
@@ -5266,10 +6196,10 @@ index 000000000..a543733f5
 +export default adminModelTraceAPI
 diff --git a/frontend/src/api/modelTrace.ts b/frontend/src/api/modelTrace.ts
 new file mode 100644
-index 000000000..10e0041e7
+index 000000000..64831196c
 --- /dev/null
 +++ b/frontend/src/api/modelTrace.ts
-@@ -0,0 +1,64 @@
+@@ -0,0 +1,87 @@
 +import { apiClient } from './client'
 +
 +export interface TraceCandidate {
@@ -5302,13 +6232,36 @@ index 000000000..10e0041e7
 +  active: number
 +}
 +
-+export interface TraceSnapshot {
++/** Optional during rollout. Snapshot time is a read watermark, never a check time. */
++export interface TraceSnapshotTiming {
++  snapshot_at?: string
++  queued_at?: string | null
++  available_at?: string | null
++  started_at?: string | null
++  schedule_mode?: 'scheduled' | 'manual'
++}
++
++/** Compare DB read watermarks without dropping UTC ISO sub-millisecond precision. */
++export function isOlderTraceSnapshot(incoming: string | undefined, current: string | undefined): boolean {
++  const currentMs = Date.parse(current || '')
++  if (!Number.isFinite(currentMs)) return false
++  const incomingMs = Date.parse(incoming || '')
++  if (!Number.isFinite(incomingMs)) return true
++  if (incomingMs !== currentMs) return incomingMs < currentMs
++  const micros = (value: string | undefined) =>
++    (value?.match(/\.(\d+)(?:Z|[+-]\d{2}:\d{2})$/i)?.[1] || '').padEnd(6, '0').slice(3, 6)
++  return micros(incoming) < micros(current)
++}
++
++export interface TraceSnapshot extends TraceSnapshotTiming {
 +  monitor_id: number
 +  model: string
 +  scope_label: string
 +  enabled: boolean
 +  supported: boolean
 +  running: boolean
++  /** Optional during rollout from sidecars without explicit scheduling state. */
++  queued?: boolean
 +  interval_seconds: number
 +  last_checked_at: string | null
 +  next_run_at: string | null
@@ -5336,10 +6289,10 @@ index 000000000..10e0041e7
 +}
 diff --git a/frontend/src/components/account/AccountTraceBadgePopover.vue b/frontend/src/components/account/AccountTraceBadgePopover.vue
 new file mode 100644
-index 000000000..1372b844f
+index 000000000..3e6c66f11
 --- /dev/null
 +++ b/frontend/src/components/account/AccountTraceBadgePopover.vue
-@@ -0,0 +1,810 @@
+@@ -0,0 +1,943 @@
 +<template>
 +  <div v-if="isVisible" class="relative inline-flex items-center" @click.stop @keydown.stop>
 +    <!-- 小标签 Button -->
@@ -5404,7 +6357,25 @@ index 000000000..1372b844f
 +              </div>
 +            </div>
 +
-+            <!-- 每个模型一行：有问题的自动展开，正常的收起（点击可切换） -->
++            <div
++              v-if="notParticipating"
++              class="rounded-lg bg-gray-100 px-2.5 py-2 text-[11px] leading-relaxed text-gray-600 dark:bg-dark-700 dark:text-gray-300"
++              data-testid="popover-inactive-note"
++            >
++              {{ inactiveReasonLabel(currentTraceItem?.inactive_reason) }}，已停止自动探测，下面是最后一次结果。重新参与调度后自动恢复。
++            </div>
++
++            <div v-if="isRunningOrQueued" class="text-blue-700 dark:text-blue-300" data-testid="popover-job-status">
++              {{ runningLabel }}<template v-if="currentTraceItem?.next_model"> · {{ currentTraceItem.next_model }}</template>
++              <span v-if="currentTraceItem?.queued_at" class="text-gray-500"> · 入队 {{ shortTime(currentTraceItem.queued_at) }}</span>
++              <span v-if="currentTraceItem?.running && currentTraceItem.started_at" class="text-gray-500"> · 开始 {{ shortTime(currentTraceItem.started_at) }}</span>
++              <span v-else-if="currentTraceItem?.queued && currentTraceItem.available_at" class="text-gray-500"> · 可执行 {{ shortTime(currentTraceItem.available_at) }}</span>
++            </div>
++
++            <!-- Completed history is retained even when a model is no longer probeable. -->
++            <div v-if="isRetesting" class="text-gray-500 dark:text-gray-400" data-testid="popover-retest-progress">
++              复测进度 {{ currentTraceItem?.retest_progress?.done }}/{{ currentTraceItem?.retest_progress?.total }}
++            </div>
 +            <div class="max-h-[22rem] overflow-y-auto pr-0.5" data-testid="popover-models-list">
 +              <div
 +                v-for="row in modelRows"
@@ -5429,7 +6400,12 @@ index 000000000..1372b844f
 +                    {{ chipText(row) }}
 +                  </span>
 +                  <span
-+                    v-if="row.pausedText"
++                    v-if="!row.probeable"
++                    class="inline-flex shrink-0 rounded-full bg-gray-100 px-2 py-0.5 text-[11px] text-gray-500 dark:bg-dark-700"
++                    data-testid="popover-model-state"
++                  >已移除 · 仅历史</span>
++                  <span
++                    v-else-if="row.pausedText"
 +                    class="inline-flex shrink-0 items-center rounded-full bg-red-600 px-2 py-0.5 text-[11px] font-medium text-white"
 +                    data-testid="popover-model-state"
 +                  >暂停中</span>
@@ -5437,7 +6413,7 @@ index 000000000..1372b844f
 +                    v-else-if="row.latest?.status === 'match'"
 +                    class="inline-flex shrink-0 items-center rounded-full bg-emerald-600 px-2 py-0.5 text-[11px] font-medium text-white"
 +                    data-testid="popover-model-state"
-+                  >调度正常</span>
++                  >可探测</span>
 +                </button>
 +
 +                <div v-if="isRowOpen(row)" class="space-y-1 pb-2.5 pl-4 text-[11px] text-gray-500 dark:text-gray-400" data-testid="popover-model-detail">
@@ -5482,6 +6458,31 @@ index 000000000..1372b844f
 +              </div>
 +            </div>
 +
++            <!-- 多 Key：逐个 Key 显示所选模型的最近结果 -->
++            <div
++              v-if="memberRows.length > 1"
++              class="space-y-1 border-t border-gray-100 pt-2.5 dark:border-dark-700"
++              data-testid="popover-members"
++            >
++              <div class="text-[11px] text-gray-400 dark:text-gray-500">各 Key 最近结果 · <span class="font-mono">{{ selectedModel }}</span></div>
++              <div
++                v-for="m in memberRows"
++                :key="m.accountId"
++                class="flex items-center gap-2 text-[11px]"
++                :class="m.participating ? '' : 'opacity-60'"
++                data-testid="popover-member-row"
++              >
++                <span class="min-w-0 truncate text-gray-700 dark:text-gray-300" :title="m.name">{{ m.name }}</span>
++                <span v-if="!m.participating" class="shrink-0 text-gray-400 dark:text-gray-500" data-testid="popover-member-inactive">{{ m.reasonText }}</span>
++                <span class="ml-auto shrink-0 text-gray-400 dark:text-gray-500">{{ m.timeText }}</span>
++                <span
++                  class="inline-flex shrink-0 items-center rounded-full px-2 py-0.5 font-medium"
++                  :class="getModelBadgeClass(m.latest)"
++                  data-testid="popover-member-conclusion"
++                >{{ m.statusText }}</span>
++              </div>
++            </div>
++
 +            <!-- 立即检测：选模型 + 按钮 -->
 +            <div class="space-y-1.5 border-t border-gray-100 pt-3 dark:border-dark-700" data-testid="popover-actions">
 +              <div class="flex items-center gap-2">
@@ -5513,6 +6514,9 @@ index 000000000..1372b844f
 +              >
 +                {{ actionMessage }}
 +              </p>
++              <p v-if="notParticipating" class="text-[11px] text-gray-500 dark:text-gray-400" data-testid="popover-run-disabled-note">
++                未参与调度的账号无法检测（宿主会拒绝探针）。
++              </p>
 +              <p class="text-[10px] text-gray-400 dark:text-gray-500">
 +                本站专用探针 · 与连通性检测独立 · 仅供统计参考
 +              </p>
@@ -5527,9 +6531,22 @@ index 000000000..1372b844f
 +<script setup lang="ts">
 +import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 +import type { AccountTraceItem, AccountTraceLatest, AccountTracePerModel } from '@/api/admin/modelTrace'
++import { isOlderTraceSnapshot } from '@/api/modelTrace'
 +import { getLayoutRect, getLayoutViewport } from '@/utils/floatingPanel'
 +
 +const HISTORY_LIMIT = 12
++
++const INACTIVE_REASON_LABELS: Record<string, string> = {
++  unschedulable: '已关闭调度',
++  rate_limited: '限流中',
++  temp_unschedulable: '临时不可调度',
++  error: '账号异常',
++  disabled: '已停用',
++}
++
++function inactiveReasonLabel(reason: string | null | undefined): string {
++  return (reason && INACTIVE_REASON_LABELS[reason]) || '未参与调度'
++}
 +
 +const STATUS_LABELS: Record<string, string> = {
 +  match: '一致',
@@ -5629,36 +6646,43 @@ index 000000000..1372b844f
 +const actionMessage = ref('')
 +const actionIsError = ref(false)
 +const selectedModel = ref('')
++const currentTraceItem = ref<AccountTraceItem | null>(null)
++
++watch(() => [props.accountId, props.traceItem] as const, ([id, item], previous) => {
++  if (previous && previous[0] !== id) {
++    currentTraceItem.value = null
++    selectedModel.value = ''
++    actionMessage.value = ''
++    actionIsError.value = false
++  }
++  if (!item || (item.account_id !== id && !item.member_account_ids?.includes(id))) {
++    currentTraceItem.value = null
++    return
++  }
++  if (isOlderTraceSnapshot(item.snapshot_at, currentTraceItem.value?.snapshot_at)) return
++  currentTraceItem.value = item
++}, { immediate: true, flush: 'sync' })
++
 +
 +const isVisible = computed(() => {
 +  if (props.unavailable) return false
-+  if (!props.traceItem) return false
-+  return Array.isArray(props.traceItem.models) && props.traceItem.models.length > 0
++  if (!currentTraceItem.value) return false
++  return modelRows.value.length > 0
 +})
 +
 +const availableModels = computed(() => {
-+  return props.traceItem?.models || []
++  return [...new Set(currentTraceItem.value?.models || [])]
 +})
 +
-+// Initialize/watch selectedModel
-+watch(
-+  () => [props.traceItem?.next_model, props.traceItem?.models],
-+  () => {
-+    const item = props.traceItem
-+    if (!item) return
-+    if (item.next_model && item.models?.includes(item.next_model)) {
-+      selectedModel.value = item.next_model
-+    } else if (item.models && item.models.length > 0) {
-+      if (!item.models.includes(selectedModel.value)) {
-+        selectedModel.value = item.models[0]
-+      }
-+    }
-+  },
-+  { immediate: true }
-+)
++// Preserve a valid user choice; next_model describes a job, not form state.
++watch(availableModels, (models) => {
++  if (models.includes(selectedModel.value)) return
++  const pendingModel = currentTraceItem.value?.next_model
++  selectedModel.value = pendingModel && models.includes(pendingModel) ? pendingModel : (models[0] || '')
++}, { immediate: true, flush: 'sync' })
 +
 +const headerTitle = computed(() => {
-+  const item = props.traceItem
++  const item = currentTraceItem.value
 +  if (!item) return `#${props.accountId}`
 +  if (item.cluster_id && item.cluster_name) {
 +    const keyCount = item.member_account_ids?.length || 0
@@ -5667,15 +6691,46 @@ index 000000000..1372b844f
 +  return item.name || `#${props.accountId}`
 +})
 +
++const notParticipating = computed(() => currentTraceItem.value?.participating === false)
++
++interface MemberRow {
++  accountId: number
++  name: string
++  participating: boolean
++  reasonText: string
++  latest: AccountTraceLatest | null
++  statusText: string
++  timeText: string
++}
++
++const memberRows = computed<MemberRow[]>(() => {
++  const members = currentTraceItem.value?.members || []
++  const model = selectedModel.value
++  return members
++    .filter((m) => !model || m.models.includes(model) || m.latest_by_model?.[model])
++    .map((m) => {
++      const latest = (model && m.latest_by_model?.[model]) || null
++      return {
++        accountId: m.account_id,
++        name: m.name || `#${m.account_id}`,
++        participating: m.participating !== false,
++        reasonText: inactiveReasonLabel(m.inactive_reason),
++        latest,
++        statusText: latest ? (STATUS_LABELS[latest.status] || latest.status) : '未检测',
++        timeText: latest ? shortTime(latest.checked_at) : '',
++      }
++    })
++})
++
 +const isRunningOrQueued = computed(() => {
-+  return props.optimisticQueued || props.traceItem?.running === true || props.traceItem?.queued === true || submitting.value
++  return props.optimisticQueued || currentTraceItem.value?.running === true || currentTraceItem.value?.queued === true || submitting.value
 +})
 +
 +// Short on purpose: the badge sits in a narrow status column.
-+const runningLabel = computed(() => (props.traceItem?.running === true ? '检测中' : '排队中'))
++const runningLabel = computed(() => (currentTraceItem.value?.running === true ? '检测中' : '排队中'))
 +
 +const isRetesting = computed(() => {
-+  const p = props.traceItem?.retest_progress
++  const p = currentTraceItem.value?.retest_progress
 +  return !!p && typeof p.done === 'number' && typeof p.total === 'number' && p.total > 0
 +})
 +
@@ -5693,14 +6748,14 @@ index 000000000..1372b844f
 +}
 +
 +const worstEvaluation = computed<WorstEvaluation>(() => {
-+  const item = props.traceItem
++  const item = currentTraceItem.value
 +  if (!item) return { rank: 0, latest: null }
 +
 +  // Check per_model if present, else fallback to latest
 +  let list: (AccountTraceLatest | null)[] = []
 +  if (Array.isArray(item.per_model) && item.per_model.length > 0) {
-+    list = item.per_model.map((pm) => pm.latest)
-+  } else if (item.latest) {
++    list = item.per_model.filter((pm) => item.models.includes(pm.model)).map((pm) => pm.latest)
++  } else if (item.latest && item.models.includes(item.latest.model)) {
 +    list = [item.latest]
 +  }
 +
@@ -5727,9 +6782,8 @@ index 000000000..1372b844f
 +  return { rank: worstRank, latest: worstLatest }
 +})
 +
-+const tagStatus = computed<'running' | 'retesting' | 'suspect' | 'uncertain' | 'error' | 'match' | 'waiting'>(() => {
++const tagStatus = computed<'running' | 'suspect' | 'uncertain' | 'error' | 'match' | 'waiting'>(() => {
 +  if (isRunningOrQueued.value) return 'running'
-+  if (isRetesting.value) return 'retesting'
 +  const { rank } = worstEvaluation.value
 +  if (rank === 4) return 'suspect'
 +  if (rank === 3) return 'uncertain'
@@ -5739,7 +6793,9 @@ index 000000000..1372b844f
 +})
 +
 +const modeLabel = computed(() => {
-+  const mode = props.traceItem?.mode
++  if (notParticipating.value) return '未参与调度'
++  if (currentTraceItem.value?.schedule_mode === 'manual') return '手动调度'
++  const mode = currentTraceItem.value?.mode
 +  if (mode === 'active') return '活跃·5分钟'
 +  return '空闲·1小时'
 +})
@@ -5749,7 +6805,7 @@ index 000000000..1372b844f
 +})
 +
 +const modeBadgeClass = computed(() => {
-+  const mode = props.traceItem?.mode
++  const mode = currentTraceItem.value?.mode
 +  if (mode === 'active') {
 +    return 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300'
 +  }
@@ -5757,6 +6813,13 @@ index 000000000..1372b844f
 +})
 +
 +const tagText = computed(() => {
++  const text = resultTagText.value
++  // Last result stays visible, but must not read like a live verdict.
++  return notParticipating.value ? `停测 · ${text.replace(/^[✓⚠]\s*/, '')}` : text
++})
++
++const resultTagText = computed(() => {
++  if (availableModels.value.length === 0 && !isRunningOrQueued.value) return '历史结果'
 +  const { latest } = worstEvaluation.value
 +  const prob = latest && isProbability(latest.target_probability)
 +    ? percent(latest.target_probability)
@@ -5766,12 +6829,8 @@ index 000000000..1372b844f
 +    case 'match':
 +      return prob ? `✓ 一致 ${prob}` : '✓ 一致'
 +    case 'suspect':
-+      if (modelRows.value.some((row) => row.pausedText)) return '⚠ 可疑 · 已暂停'
++      if (modelRows.value.some((row) => row.probeable && row.pausedText)) return '⚠ 可疑 · 已暂停'
 +      return prob ? `⚠ 可疑 ${prob}` : '⚠ 可疑'
-+    case 'retesting': {
-+      const p = props.traceItem?.retest_progress
-+      return p ? `复测中 ${p.done}/${p.total}` : '复测中'
-+    }
 +    case 'uncertain':
 +      return prob ? `不确定 ${prob}` : '不确定'
 +    case 'error':
@@ -5785,12 +6844,14 @@ index 000000000..1372b844f
 +})
 +
 +const tagBadgeClass = computed(() => {
++  if (notParticipating.value) {
++    return 'bg-gray-100 text-gray-500 hover:bg-gray-200 dark:bg-dark-700 dark:text-gray-400 dark:hover:bg-dark-600 ring-1 ring-gray-400/20'
++  }
 +  switch (tagStatus.value) {
 +    case 'match':
 +      return 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100 dark:bg-emerald-950/40 dark:text-emerald-300 dark:hover:bg-emerald-900/50 ring-1 ring-emerald-500/20'
 +    case 'suspect':
 +      return 'bg-red-50 text-red-700 hover:bg-red-100 dark:bg-red-950/40 dark:text-red-300 dark:hover:bg-red-900/50 ring-1 ring-red-500/20'
-+    case 'retesting':
 +    case 'uncertain':
 +      return 'bg-amber-50 text-amber-700 hover:bg-amber-100 dark:bg-amber-950/40 dark:text-amber-300 dark:hover:bg-amber-900/50 ring-1 ring-amber-500/20'
 +    case 'running':
@@ -5809,6 +6870,7 @@ index 000000000..1372b844f
 +
 +// 一模型一行模型列表计算
 +interface ModelRowData {
++  probeable: boolean
 +  pausedText: string
 +  model: string
 +  latest: AccountTraceLatest | null
@@ -5825,7 +6887,7 @@ index 000000000..1372b844f
 +}
 +
 +const modelRows = computed<ModelRowData[]>(() => {
-+  const item = props.traceItem
++  const item = currentTraceItem.value
 +  if (!item) return []
 +
 +  const perModelMap = new Map<string, AccountTracePerModel>()
@@ -5835,20 +6897,27 @@ index 000000000..1372b844f
 +    }
 +  }
 +
-+  const models = item.models || []
++  const models = [...new Set([
++    ...availableModels.value,
++    ...perModelMap.keys(),
++    ...(item.latest ? [item.latest.model] : []),
++    ...(item.history || []).map((round) => round.model),
++  ])]
 +  return models.map((model) => {
 +    const pm = perModelMap.get(model)
++    const probeable = availableModels.value.includes(model)
 +    // Fallback: if no per_model structure but item.latest is for this model
 +    let latest: AccountTraceLatest | null = pm?.latest ?? null
 +    let history: AccountTraceLatest[] = pm?.history ?? []
-+    if (!latest && item.latest?.model === model) {
-+      latest = item.latest
-+      history = item.history || []
++    if (!pm) {
++      history = (item.history || []).filter((round) => round.model === model)
++      latest = item.latest?.model === model ? item.latest
++        : [...history].sort((a, b) => Date.parse(b.checked_at) - Date.parse(a.checked_at))[0] ?? null
 +    }
 +
 +    const relativeTime = latest?.checked_at ? formatRelativeTime(latest.checked_at) : ''
 +    const pausedMs = pm?.paused_until ? Date.parse(pm.paused_until) : NaN
-+    const pausedText = Number.isFinite(pausedMs) && pausedMs > Date.now()
++    const pausedText = probeable && Number.isFinite(pausedMs) && pausedMs > Date.now()
 +      ? new Date(pausedMs).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', hour12: false })
 +      : ''
 +
@@ -5895,6 +6964,7 @@ index 000000000..1372b844f
 +    const dots = [...Array<null>(HISTORY_LIMIT - rounds.length).fill(null), ...rounds]
 +
 +    return {
++      probeable,
 +      model,
 +      latest,
 +      relativeTime,
@@ -5964,12 +7034,16 @@ index 000000000..1372b844f
 +
 +const nextRunShort = computed(() => {
 +  if (props.unavailable) return '暂不可用'
-+  if (!props.traceItem) return props.loading ? '读取中' : '—'
-+  return shortTime(props.traceItem.next_run_at)
++  if (!currentTraceItem.value) return props.loading ? '读取中' : '—'
++  if (currentTraceItem.value.running) return '本轮结束后更新'
++  if (currentTraceItem.value.queued) return shortTime(currentTraceItem.value.available_at ?? currentTraceItem.value.next_run_at)
++  if (notParticipating.value) return '暂停探测'
++  if (currentTraceItem.value.schedule_mode === 'manual') return '手动触发'
++  return currentTraceItem.value.next_run_at ? shortTime(currentTraceItem.value.next_run_at) : '暂无计划'
 +})
 +
 +const canRun = computed(() => {
-+  return !isRunningOrQueued.value && !submitting.value
++  return !props.unavailable && !!currentTraceItem.value && !notParticipating.value && availableModels.value.includes(selectedModel.value) && !isRunningOrQueued.value && !submitting.value
 +})
 +
 +function isProbability(value: number | null | undefined): value is number {
@@ -6100,9 +7174,19 @@ index 000000000..1372b844f
 +})
 +
 +const rowBusy = ref<string | null>(null)
++let resetTimer: ReturnType<typeof setTimeout> | undefined
 +
 +// Every model row is open by default; the admin can collapse any row.
 +const rowToggles = ref<Record<string, boolean>>({})
++watch(() => props.accountId, () => {
++  if (resetTimer !== undefined) clearTimeout(resetTimer)
++  rowBusy.value = null
++  rowToggles.value = {}
++  showPopover.value = false
++}, { flush: 'sync' })
++onBeforeUnmount(() => {
++  if (resetTimer !== undefined) clearTimeout(resetTimer)
++})
 +function defaultOpen(_row: ModelRowData): boolean {
 +  return true
 +}
@@ -6119,18 +7203,20 @@ index 000000000..1372b844f
 +}
 +
 +function handleRetestModel(model: string): void {
++  if (!availableModels.value.includes(model)) return
 +  selectedModel.value = model
 +  void handleRun()
 +}
 +
 +function handleResetModel(model: string): void {
-+  if (rowBusy.value) return
++  if (rowBusy.value || !availableModels.value.includes(model)) return
 +  rowBusy.value = model
 +  actionIsError.value = false
 +  actionMessage.value = '已提交重置，几秒后刷新结果。'
 +  emit('reset', props.accountId, model)
-+  window.setTimeout(() => {
++  resetTimer = setTimeout(() => {
 +    rowBusy.value = null
++    resetTimer = undefined
 +  }, 1500)
 +}
 +
@@ -6140,8 +7226,8 @@ index 000000000..1372b844f
 +  actionMessage.value = ''
 +  actionIsError.value = false
 +  try {
-+    emit('run', props.accountId, selectedModel.value || undefined)
-+    actionMessage.value = '已提交，后台串行检测，不影响正常调用。'
++    emit('run', props.accountId, selectedModel.value)
++    actionMessage.value = '已请求检测，等待后台确认。'
 +  } catch (err: any) {
 +    actionIsError.value = true
 +    actionMessage.value = err?.message || '未能提交：检测可能已排队、正在冷却或服务暂不可用。'
@@ -6152,10 +7238,10 @@ index 000000000..1372b844f
 +</script>
 diff --git a/frontend/src/components/account/__tests__/AccountTraceBadgePopover.spec.ts b/frontend/src/components/account/__tests__/AccountTraceBadgePopover.spec.ts
 new file mode 100644
-index 000000000..43d634f69
+index 000000000..5aa40d117
 --- /dev/null
 +++ b/frontend/src/components/account/__tests__/AccountTraceBadgePopover.spec.ts
-@@ -0,0 +1,448 @@
+@@ -0,0 +1,584 @@
 +import { mount } from '@vue/test-utils'
 +import { beforeEach, describe, expect, it } from 'vitest'
 +import { nextTick } from 'vue'
@@ -6212,7 +7298,7 @@ index 000000000..43d634f69
 +    const wrapperNull = mountComponent({ traceItem: null })
 +    expect(wrapperNull.find('[data-testid="account-trace-badge"]').exists()).toBe(false)
 +
-+    const wrapperEmptyModels = mountComponent({ traceItem: makeTraceItem({ models: [] }) })
++    const wrapperEmptyModels = mountComponent({ traceItem: makeTraceItem({ models: [], latest: null, history: [] }) })
 +    expect(wrapperEmptyModels.find('[data-testid="account-trace-badge"]').exists()).toBe(false)
 +  })
 +
@@ -6252,15 +7338,19 @@ index 000000000..43d634f69
 +    expect(badge.classes()).toContain('text-red-700')
 +  })
 +
-+  it('renders retest progress state "复测中 1/3"', () => {
++  it('keeps retained retest progress separate from an idle job and completed result', async () => {
 +    const wrapper = mountComponent({
 +      traceItem: makeTraceItem({
 +        retest_progress: { done: 1, total: 3 },
 +      }),
 +    })
 +    const badge = wrapper.find('[data-testid="account-trace-badge"]')
-+    expect(badge.text()).toBe('复测中 1/3')
-+    expect(badge.classes()).toContain('text-amber-700')
++    expect(badge.text()).toBe('✓ 一致 79.9%')
++    expect(badge.classes()).toContain('text-emerald-700')
++    await badge.trigger('click')
++    expect(document.body.querySelector('[data-testid="popover-retest-progress"]')?.textContent).toContain('复测进度 1/3')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')).toBeNull()
++    wrapper.unmount()
 +  })
 +
 +  it('renders error state "检测失败"', () => {
@@ -6589,7 +7679,7 @@ index 000000000..43d634f69
 +
 +    const [terra, luna] = rows
 +    expect(terra.querySelector('[data-testid="popover-model-conclusion"]')?.textContent?.trim()).toBe('一致 92.6%')
-+    expect(terra.querySelector('[data-testid="popover-model-state"]')?.textContent?.trim()).toBe('调度正常')
++    expect(terra.querySelector('[data-testid="popover-model-state"]')?.textContent?.trim()).toBe('可探测')
 +    // The matched model is not repeated as its own best candidate.
 +    expect(terra.querySelector('[data-testid="popover-model-best"]')).toBeNull()
 +    expect(luna.querySelector('[data-testid="popover-model-conclusion"]')?.textContent?.trim()).toBe('不确定 <0.1%')
@@ -6601,6 +7691,138 @@ index 000000000..43d634f69
 +    ;(terra.querySelector('[data-testid="popover-model-toggle"]') as HTMLButtonElement).click()
 +    await nextTick()
 +    expect(terra.querySelector('[data-testid="popover-model-detail"]')).not.toBeNull()
++    wrapper.unmount()
++  })
++})
++
++describe('account probe targets, scheduling and stale views', () => {
++  it('offers untested targets but keeps removed history out of the dropdown and current verdict', async () => {
++    const removed = { model: 'removed-model', status: 'suspect', message_code: 'difference_signal', target_probability: 0.1, best_model: null, checked_at: '2026-09-24T12:00:00Z' }
++    const wrapper = mountComponent({ traceItem: makeTraceItem({ models: ['new-untested-model'], latest: removed, per_model: [{ model: removed.model, latest: removed, history: [removed], paused_until: '2099-01-01T00:00:00Z' }] }) })
++    expect(wrapper.get('[data-testid="account-trace-badge"]').text()).toBe('未检测')
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    const select = document.body.querySelector('[data-testid="trace-model-select"]') as HTMLSelectElement
++    expect([...select.options].map(option => option.value)).toEqual(['new-untested-model'])
++    const rows = document.body.querySelectorAll('[data-testid="popover-model-row"]')
++    expect(rows).toHaveLength(2)
++    expect(rows[0].textContent).toContain('未检测')
++    expect(rows[1].textContent).toContain('已移除 · 仅历史')
++    expect(rows[1].textContent).toContain('可疑')
++    expect(rows[1].querySelector('[data-testid="popover-model-retest"]')).toBeNull()
++    expect(rows[1].querySelector('[data-testid="popover-model-reset"]')).toBeNull()
++    ;(document.body.querySelector('[data-testid="popover-run-btn"]') as HTMLButtonElement).click()
++    await nextTick()
++    expect(wrapper.emitted('run')?.[0]).toEqual([17, 'new-untested-model'])
++    wrapper.unmount()
++  })
++
++  it('retains read-only history when all targets are removed, without enabling any probe', async () => {
++    const wrapper = mountComponent({ traceItem: makeTraceItem({ models: [], next_model: null }) })
++    expect(wrapper.get('[data-testid="account-trace-badge"]').text()).toBe('历史结果')
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    expect(document.body.textContent).toContain('已移除 · 仅历史')
++    const select = document.body.querySelector('[data-testid="trace-model-select"]') as HTMLSelectElement
++    expect(select.options).toHaveLength(0)
++    expect((document.body.querySelector('[data-testid="popover-run-btn"]') as HTMLButtonElement).disabled).toBe(true)
++    expect(wrapper.emitted('run')).toBeUndefined()
++    wrapper.unmount()
++  })
++
++  it('preserves a valid user choice across pending model changes and repairs a removed choice', async () => {
++    const base = makeTraceItem({ models: ['gpt-5.6-sol', 'gpt-5.6-luna'], next_model: 'gpt-5.6-sol' })
++    const wrapper = mountComponent({ traceItem: base })
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    const select = document.body.querySelector('[data-testid="trace-model-select"]') as HTMLSelectElement
++    select.value = 'gpt-5.6-luna'
++    select.dispatchEvent(new Event('change'))
++    await nextTick()
++    await wrapper.setProps({ traceItem: { ...base, models: [...base.models], queued: true, next_model: 'gpt-5.6-sol' } })
++    expect(select.value).toBe('gpt-5.6-luna')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('排队中 · gpt-5.6-sol')
++    await wrapper.setProps({ traceItem: { ...base, models: ['gpt-5.6-sol'], queued: false, next_model: null } })
++    expect(select.value).toBe('gpt-5.6-sol')
++    expect(wrapper.emitted('run')).toBeUndefined()
++    wrapper.unmount()
++  })
++
++  it('separates manual scheduling and job activity from previous results, rejecting old microsecond snapshots', async () => {
++    const base = makeTraceItem({ schedule_mode: 'manual', snapshot_at: '2026-09-25T00:00:00.123456Z', next_run_at: '2099-01-01T00:00:00Z' })
++    const wrapper = mountComponent({ traceItem: base })
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    expect(document.body.textContent).toContain('手动调度')
++    expect(document.body.querySelector('[data-testid="popover-subtitle"]')?.textContent).toContain('手动触发')
++    await wrapper.setProps({ traceItem: { ...base, snapshot_at: '2026-09-25T00:00:00.123457Z', queued: true, available_at: '2026-09-25T00:00:05Z' } })
++    expect(wrapper.get('[data-testid="account-trace-badge"]').text()).toBe('排队中')
++    expect(document.body.querySelector('[data-testid="popover-model-conclusion"]')?.textContent).toContain('一致')
++    await wrapper.setProps({ traceItem: { ...base, snapshot_at: '2026-09-25T00:00:00.123456Z', running: true, queued: false } })
++    expect(wrapper.get('[data-testid="account-trace-badge"]').text()).toBe('排队中')
++    await wrapper.setProps({ traceItem: { ...base, snapshot_at: '2026-09-25T00:00:00.123458Z', running: true, started_at: '2026-09-25T00:00:06Z' } })
++    expect(wrapper.get('[data-testid="account-trace-badge"]').text()).toBe('检测中')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('开始')
++    expect(document.body.querySelector('[data-testid="popover-model-conclusion"]')?.textContent).toContain('一致')
++    wrapper.unmount()
++  })
++
++  it('clears selection and hides mismatched data when a row is reused for a different account', async () => {
++    const wrapper = mountComponent()
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    await wrapper.setProps({ accountId: 23 })
++    expect(wrapper.find('[data-testid="account-trace-badge"]').exists()).toBe(false)
++    await wrapper.setProps({ traceItem: makeTraceItem({ account_id: 23, models: ['new-model'], latest: null }) })
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    expect((document.body.querySelector('[data-testid="trace-model-select"]') as HTMLSelectElement).value).toBe('new-model')
++    expect(wrapper.emitted('run')).toBeUndefined()
++    wrapper.unmount()
++  })
++})
++
++describe('AccountTraceBadgePopover participation and per-key results', () => {
++  const round = (status: string, at: string) => ({
++    model: 'gpt-5.6-sol', status, message_code: status === 'match' ? 'compatible' : 'upstream_error',
++    target_probability: status === 'match' ? 0.95 : null, best_model: null, checked_at: at,
++  })
++
++  it('shows a switched-off account greyed with its last result and no run', async () => {
++    const wrapper = mountComponent({
++      traceItem: makeTraceItem({ participating: false, inactive_reason: 'unschedulable', schedule_mode: 'manual' }),
++    })
++    const badge = wrapper.find('[data-testid="account-trace-badge"]')
++    expect(badge.text()).toBe('停测 · 一致 79.9%')
++    expect(badge.classes()).toContain('text-gray-500')
++    await badge.trigger('click')
++    await nextTick()
++    expect(document.querySelector('[data-testid="popover-inactive-note"]')?.textContent).toContain('已关闭调度')
++    expect(document.querySelector('[data-testid="popover-mode-badge"]')?.textContent).toBe('未参与调度')
++    expect(document.querySelector('[data-testid="popover-subtitle"]')?.textContent).toContain('暂停探测')
++    expect((document.querySelector('[data-testid="popover-run-btn"]') as HTMLButtonElement).disabled).toBe(true)
++    wrapper.unmount()
++  })
++
++  it('lists every key of a cluster, greying keys outside the pool', async () => {
++    const wrapper = mountComponent({
++      accountId: 5,
++      traceItem: makeTraceItem({
++        account_id: 7,
++        cluster_id: 'c1',
++        cluster_name: 'Upstream',
++        member_account_ids: [5, 7, 23],
++        participating: true,
++        members: [
++          { account_id: 5, name: 'key-5', participating: false, inactive_reason: 'rate_limited', models: ['gpt-5.6-sol'], latest_by_model: { 'gpt-5.6-sol': round('match', '2026-09-24T11:00:00Z') } },
++          { account_id: 7, name: 'key-7', participating: true, models: ['gpt-5.6-sol'], latest_by_model: { 'gpt-5.6-sol': round('error', '2026-09-24T12:00:00Z') } },
++          { account_id: 23, name: 'key-23', participating: true, models: ['gpt-5.6-sol'], latest_by_model: { 'gpt-5.6-sol': null } },
++        ],
++      }),
++    })
++    await wrapper.find('[data-testid="account-trace-badge"]').trigger('click')
++    await nextTick()
++    const rows = [...document.querySelectorAll('[data-testid="popover-member-row"]')]
++    expect(rows.map(r => r.querySelector('[data-testid="popover-member-conclusion"]')?.textContent?.trim()))
++      .toEqual(['一致', '检测失败', '未检测'])
++    expect(rows[0].classList.contains('opacity-60')).toBe(true)
++    expect(rows[0].querySelector('[data-testid="popover-member-inactive"]')?.textContent).toBe('限流中')
++    expect(rows[1].classList.contains('opacity-60')).toBe(false)
++    expect((document.querySelector('[data-testid="popover-run-btn"]') as HTMLButtonElement).disabled).toBe(false)
 +    wrapper.unmount()
 +  })
 +})
@@ -6630,10 +7852,10 @@ index 8bc680c64..f1c155821 100644
      isQuotaVisible.mockReturnValue(false)
 diff --git a/frontend/src/components/user/monitor/ModelTraceBadgePopover.vue b/frontend/src/components/user/monitor/ModelTraceBadgePopover.vue
 new file mode 100644
-index 000000000..5c3f7c1e8
+index 000000000..38a082ee7
 --- /dev/null
 +++ b/frontend/src/components/user/monitor/ModelTraceBadgePopover.vue
-@@ -0,0 +1,823 @@
+@@ -0,0 +1,846 @@
 +<template>
 +  <div v-if="isVisible" class="relative inline-flex items-center" @click.stop @keydown.stop>
 +    <!-- 小标签 Button -->
@@ -6692,7 +7914,7 @@ index 000000000..5c3f7c1e8
 +                {{ model }}
 +              </div>
 +              <div class="shrink-0 text-[11px] text-gray-400 dark:text-gray-500">
-+                下次 {{ nextRunShort }}
++                {{ isManualSchedule ? '手动调度' : `下次 ${nextRunShort}` }}
 +              </div>
 +            </div>
 +
@@ -6717,8 +7939,14 @@ index 000000000..5c3f7c1e8
 +              </span>
 +            </div>
 +
-+            <!-- 结论一行：浅色结论胶囊，紧跟概率，“更像 xxx” -->
++            <div v-if="jobStatusLabel" class="text-blue-700 dark:text-blue-300" data-testid="popover-job-status">
++              {{ jobStatusLabel }}
++              <span v-if="currentSnapshot?.queued_at" class="ml-1 text-gray-500">· 入队 {{ shortTime(currentSnapshot.queued_at) }}</span>
++            </div>
++
++            <!-- Job activity never replaces the previous completed result. -->
 +            <div class="flex flex-wrap items-center gap-2">
++              <span v-if="jobStatusLabel && latest" class="text-gray-500">上次结果</span>
 +              <span
 +                class="inline-flex items-center px-2 py-0.5 rounded-full font-medium"
 +                :class="conclusionBadgeClass"
@@ -6981,7 +8209,7 @@ index 000000000..5c3f7c1e8
 +
 +const isUpstreamModelMismatch = computed(() => latest.value?.message_code === 'upstream_model_mismatch')
 +const isEffectivelyQueued = computed(() => (
-+  localOptimisticQueued.value || props.queued
++  !isEffectivelyRunning.value && (localOptimisticQueued.value || props.queued || currentSnapshot.value?.queued === true)
 +))
 +
 +const isEffectivelyRunning = computed(() => (
@@ -7008,13 +8236,14 @@ index 000000000..5c3f7c1e8
 +// - stale → 已过期 (灰)
 +// - match → 一致 XX% (绿)
 +// - suspect → 可疑 XX% (红)
-+// - uncertain → 不确定 XX% 或 复测中 X/Y (琥珀)
++// - uncertain → 不确定 XX% 或复测进度 X/Y (琥珀)
 +// - waiting → 等待首轮 (灰)
 +type TagStatusType = 'match' | 'suspect' | 'uncertain' | 'error' | 'queued' | 'running' | 'stale' | 'waiting'
 +
 +const activeElapsedSeconds = computed(() => {
-+  const start = props.runningAt ?? props.queuedAt ?? localOptimisticStartTime.value
-+  if (!start) return 0
++  const serverStart = currentSnapshot.value?.started_at ? Date.parse(currentSnapshot.value.started_at) : NaN
++  const start = Number.isFinite(serverStart) ? serverStart : props.runningAt ?? props.queuedAt ?? localOptimisticStartTime.value
++  if (start === null || start === undefined) return 0
 +  return Math.max(0, Math.floor((nowTick.value - start) / 1000))
 +})
 +
@@ -7022,10 +8251,8 @@ index 000000000..5c3f7c1e8
 +  return `检测中 · 已用 ${activeElapsedSeconds.value} 秒`
 +})
 +
-+// Status of this monitor's own latest check — what the popover detail shows.
-+const monitorStatus = computed<TagStatusType>(() => {
-+  if (isEffectivelyRunning.value) return 'running'
-+  if (submitting.value || isEffectivelyQueued.value) return 'queued'
++// Completed result and pending job are separate facts.
++const resultStatus = computed<TagStatusType>(() => {
 +  if (isUpstreamModelMismatch.value || latest.value?.status === 'error') return 'error'
 +  if (currentSnapshot.value?.stale) return 'stale'
 +  const status = latest.value?.status
@@ -7034,6 +8261,19 @@ index 000000000..5c3f7c1e8
 +  if (status === 'uncertain') return 'uncertain'
 +  if (!latest.value) return 'waiting'
 +  return 'error'
++})
++const monitorStatus = computed<TagStatusType>(() => {
++  if (isEffectivelyRunning.value) return 'running'
++  if (submitting.value || isEffectivelyQueued.value) return 'queued'
++  return resultStatus.value
++})
++const jobStatusLabel = computed(() => {
++  if (isEffectivelyRunning.value) return activeElapsedSeconds.value > 0 ? runningLabelText.value : '检测中'
++  if (submitting.value || isEffectivelyQueued.value) {
++    const available = currentSnapshot.value?.available_at
++    return available ? `排队中 · 可执行 ${shortTime(available)}` : '排队中'
++  }
++  return ''
 +})
 +
 +// Status of the card tag. With per-account results the tag summarises accounts
@@ -7051,7 +8291,7 @@ index 000000000..5c3f7c1e8
 +})
 +
 +const conclusionLabel = computed(() => {
-+  switch (monitorStatus.value) {
++  switch (resultStatus.value) {
 +    case 'queued': return '排队中'
 +    case 'running': return activeElapsedSeconds.value > 0 ? runningLabelText.value : '检测中'
 +    case 'stale': return '结果已过期'
@@ -7065,6 +8305,7 @@ index 000000000..5c3f7c1e8
 +})
 +
 +const tagText = computed(() => {
++  if (monitorStatus.value === 'running' || monitorStatus.value === 'queued') return `一致性 · ${jobStatusLabel.value}`
 +  // 当有 accounts_summary 时显示汇总例如 "一致性 2/3"
 +  if (accountsSummary.value) {
 +    const s = accountsSummary.value
@@ -7125,7 +8366,7 @@ index 000000000..5c3f7c1e8
 +})
 +
 +const conclusionBadgeClass = computed(() => {
-+  switch (monitorStatus.value) {
++  switch (resultStatus.value) {
 +    case 'match':
 +      return 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300'
 +    case 'suspect':
@@ -7144,7 +8385,7 @@ index 000000000..5c3f7c1e8
 +})
 +
 +const conclusionProbability = computed(() => {
-+  if (currentSnapshot.value?.stale || isEffectivelyRunning.value || isEffectivelyQueued.value || submitting.value) return ''
++  if (currentSnapshot.value?.stale) return ''
 +  if (scoredLatest.value && isProbability(scoredLatest.value.target_probability)) {
 +    return percent(scoredLatest.value.target_probability)
 +  }
@@ -7152,7 +8393,7 @@ index 000000000..5c3f7c1e8
 +})
 +
 +const betterAlternativeModel = computed(() => {
-+  if (currentSnapshot.value?.stale || isEffectivelyRunning.value || isEffectivelyQueued.value || submitting.value) return ''
++  if (currentSnapshot.value?.stale) return ''
 +  const round = scoredLatest.value
 +  if (!round || !round.best_model) return ''
 +  if (round.best_model !== props.model) {
@@ -7185,7 +8426,7 @@ index 000000000..5c3f7c1e8
 +  if (!currentSnapshot.value?.supported) return ''
 +  const progress = currentSnapshot.value.retest_progress
 +  if (!progress || typeof progress.done !== 'number' || typeof progress.total !== 'number') return ''
-+  return `复测中 ${progress.done}/${progress.total}`
++  return `复测进度 ${progress.done}/${progress.total}`
 +})
 +
 +const effortBadge = computed(() => {
@@ -7231,13 +8472,18 @@ index 000000000..5c3f7c1e8
 +const lastRunLabel = computed(() => {
 +  return shortTime(currentSnapshot.value?.supported ? currentSnapshot.value.last_checked_at : null)
 +})
++const isManualSchedule = computed(() => currentSnapshot.value?.schedule_mode === 'manual')
 +
 +const nextRunShort = computed(() => {
 +  if (unavailable.value) return '暂不可用'
 +  if (mappingMismatch.value) return '待模型配置同步'
 +  if (!remoteSnapshot.value) return props.loading ? '读取中' : '—'
 +  if (!currentSnapshot.value?.supported) return '未接入'
-+  return remoteSnapshot.value.enabled ? shortTime(remoteSnapshot.value.next_run_at) : '未启用定时'
++  if (isEffectivelyRunning.value) return '本轮结束后更新'
++  if (isEffectivelyQueued.value) return shortTime(currentSnapshot.value.available_at ?? currentSnapshot.value.next_run_at)
++  if (isManualSchedule.value) return '手动触发'
++  if (currentSnapshot.value.paused_budget || currentSnapshot.value.paused_reconciliation) return '暂停调度'
++  return remoteSnapshot.value.enabled ? (remoteSnapshot.value.next_run_at ? shortTime(remoteSnapshot.value.next_run_at) : '暂无计划') : '未启用定时'
 +})
 +
 +function shortTime(value: string | null | undefined): string {
@@ -7251,11 +8497,7 @@ index 000000000..5c3f7c1e8
 +}
 +
 +const nextRunLabel = computed(() => {
-+  if (unavailable.value) return '暂不可用'
-+  if (mappingMismatch.value) return '待模型配置同步'
-+  if (!remoteSnapshot.value) return props.loading ? '读取中' : '—'
-+  if (!currentSnapshot.value?.supported) return '未接入一致性检测'
-+  return remoteSnapshot.value.enabled ? shortTime(remoteSnapshot.value.next_run_at) : '未启用定时'
++  return nextRunShort.value
 +})
 +
 +const detailMessage = computed(() => {
@@ -7435,9 +8677,12 @@ index 000000000..5c3f7c1e8
 +  }
 +}
 +
-+watch(() => props.running, (r) => {
-+  if (r) {
++watch(() => [props.snapshot, props.running, props.queued], () => {
++  if (props.running || props.queued || currentSnapshot.value?.running || currentSnapshot.value?.queued) {
 +    localOptimisticQueued.value = false
++  } else if (!submitting.value && currentSnapshot.value?.queued === false) {
++    localOptimisticQueued.value = false
++    localOptimisticStartTime.value = null
 +  }
 +})
 +
@@ -7455,7 +8700,7 @@ index 000000000..5c3f7c1e8
 +  localOptimisticQueued.value = false
 +  localOptimisticStartTime.value = null
 +  actionMessage.value = ''
-+})
++}, { flush: 'sync' })
 +</script>
 diff --git a/frontend/src/components/user/monitor/MonitorCard.vue b/frontend/src/components/user/monitor/MonitorCard.vue
 index 268790794..0b0f93dee 100644
@@ -7568,10 +8813,10 @@ index c7d24c012..f98d38bc6 100644
  const { t } = useI18n()
 diff --git a/frontend/src/components/user/monitor/__tests__/ModelTraceBadgePopover.spec.ts b/frontend/src/components/user/monitor/__tests__/ModelTraceBadgePopover.spec.ts
 new file mode 100644
-index 000000000..9e27fd8ed
+index 000000000..4488694c6
 --- /dev/null
 +++ b/frontend/src/components/user/monitor/__tests__/ModelTraceBadgePopover.spec.ts
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,609 @@
 +import { mount, flushPromises } from '@vue/test-utils'
 +import { createPinia, setActivePinia } from 'pinia'
 +import { beforeEach, describe, expect, it, vi } from 'vitest'
@@ -7721,7 +8966,7 @@ index 000000000..9e27fd8ed
 +    expect(badge.classes()).toContain('bg-amber-50')
 +  })
 +
-+  it('renders uncertain with retest_progress as "一致性 · 复测中 1/3" (amber)', () => {
++  it('renders uncertain with retest_progress as "一致性 · 复测进度 1/3" (amber)', () => {
 +    const wrapper = mountComponent({
 +      snapshot: makeSnapshot({
 +        latest: makeRound({ status: 'uncertain', target_probability: 0.41 }),
@@ -7729,7 +8974,7 @@ index 000000000..9e27fd8ed
 +      }),
 +    })
 +    const badge = wrapper.get('[data-testid="model-trace-badge"]')
-+    expect(badge.text()).toBe('一致性 · 复测中 1/3')
++    expect(badge.text()).toBe('一致性 · 复测进度 1/3')
 +    expect(badge.classes()).toContain('text-amber-700')
 +    expect(badge.classes()).toContain('bg-amber-50')
 +  })
@@ -7818,7 +9063,7 @@ index 000000000..9e27fd8ed
 +    expect(betterModel?.textContent?.trim()).toBe('更像 gpt-5.6-sol')
 +
 +    const subRow = document.body.querySelector('[data-testid="popover-sub-row"]')
-+    expect(subRow?.textContent).toContain('复测中 1/3')
++    expect(subRow?.textContent).toContain('复测进度 1/3')
 +    expect(subRow?.textContent).toContain('思考强度 medium')
 +
 +    // Recent 12 dots
@@ -7911,7 +9156,8 @@ index 000000000..9e27fd8ed
 +    // 1. Immediately optimistic queued state: badge and conclusion label show "排队中"
 +    expect(badge.text()).toBe('一致性 · 排队中')
 +    const conclBadge = document.body.querySelector('[data-testid="popover-conclusion-badge"]')
-+    expect(conclBadge?.textContent?.trim()).toBe('排队中')
++    expect(conclBadge?.textContent?.trim()).toBe('匹配')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('排队中')
 +    expect(runBtn.disabled).toBe(true)
 +    expect(runBtn.textContent).toContain('检测排队中')
 +    expect(wrapper.emitted('runSubmitted')).toBeTruthy()
@@ -7948,14 +9194,16 @@ index 000000000..9e27fd8ed
 +    await nextTick()
 +
 +    const conclBadge = document.body.querySelector('[data-testid="popover-conclusion-badge"]')
-+    expect(conclBadge?.textContent?.trim()).toBe('检测中 · 已用 5 秒')
++    expect(conclBadge?.textContent?.trim()).toBe('匹配')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('检测中 · 已用 5 秒')
 +
 +    // Advance 1 second
 +    await vi.advanceTimersByTimeAsync(1000)
 +    await nextTick()
 +
 +    expect(badge.text()).toBe('一致性 · 检测中 · 已用 6 秒')
-+    expect(conclBadge?.textContent?.trim()).toBe('检测中 · 已用 6 秒')
++    expect(conclBadge?.textContent?.trim()).toBe('匹配')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('检测中 · 已用 6 秒')
 +
 +    vi.useRealTimers()
 +  })
@@ -8125,6 +9373,59 @@ index 000000000..9e27fd8ed
 +    wrapper.unmount()
 +  })
 +})
++
++describe('monitor scheduling and activity/result separation', () => {
++  it('shows manual scheduling instead of a stale next_run_at and never treats snapshot_at as a check', async () => {
++    const wrapper = mountComponent({ snapshot: makeSnapshot({ schedule_mode: 'manual', snapshot_at: '2026-09-25T00:00:00.123456Z', next_run_at: '2099-01-01T00:00:00Z', last_checked_at: null }) })
++    await wrapper.get('[data-testid="model-trace-badge"]').trigger('click')
++    expect(document.body.textContent).toContain('手动调度')
++    expect(document.body.textContent).toContain('上次检测：— · 下次检测：手动触发')
++    expect(document.body.textContent).not.toContain('1/1 08:00')
++    wrapper.unmount()
++  })
++
++  it('shows server queued independently from a previous suspect result and account summary', async () => {
++    const wrapper = mountComponent({ snapshot: makeSnapshot({ queued: true, running: false, latest: makeRound({ status: 'suspect', target_probability: 0.1 }), accounts_summary: { model: 'gpt-6-astra', total: 2, match: 2, suspect: 0, uncertain: 0, error: 0, active: 0 } }) })
++    expect(wrapper.get('[data-testid="model-trace-badge"]').text()).toContain('排队中')
++    await wrapper.get('[data-testid="model-trace-badge"]').trigger('click')
++    expect(document.body.querySelector('[data-testid="popover-conclusion-badge"]')?.textContent).toContain('可疑')
++    expect(document.body.querySelector('[data-testid="popover-conclusion-prob"]')?.textContent).toContain('10.0%')
++    expect(document.body.querySelector('[data-testid="popover-job-status"]')?.textContent).toContain('排队中')
++    expect(document.body.textContent).toContain('上次结果')
++    wrapper.unmount()
++  })
++
++  it('uses server started_at for elapsed time and keeps the prior result visible', async () => {
++    vi.useFakeTimers()
++    vi.setSystemTime(new Date('2026-09-25T00:00:10Z'))
++    const wrapper = mountComponent({ queued: true, snapshot: makeSnapshot({ queued: false, running: true, started_at: '2026-09-25T00:00:05Z' }) })
++    expect(wrapper.get('[data-testid="model-trace-badge"]').text()).toContain('检测中 · 已用 5 秒')
++    await wrapper.get('[data-testid="model-trace-badge"]').trigger('click')
++    expect(document.body.querySelector('[data-testid="popover-conclusion-badge"]')?.textContent).toBe('匹配')
++    wrapper.unmount()
++    vi.useRealTimers()
++  })
++
++  it('ignores an old run response when the monitor model changes mid-submission', async () => {
++    const { useAuthStore } = await import('@/stores/auth')
++    useAuthStore().user = { role: 'admin' } as any
++    let resolve!: () => void
++    runModelTraceMock.mockReturnValueOnce(new Promise<void>(done => { resolve = done }))
++    const wrapper = mountComponent()
++    await wrapper.get('[data-testid="model-trace-badge"]').trigger('click')
++    ;(document.body.querySelector('[data-testid="popover-run-btn"]') as HTMLButtonElement).click()
++    await nextTick()
++    const signal = runModelTraceMock.mock.calls.at(-1)?.[1] as AbortSignal
++    await wrapper.setProps({ model: 'gpt-5.6-sol', snapshot: makeSnapshot({ model: 'gpt-5.6-sol', queued: false }) })
++    expect(signal.aborted).toBe(true)
++    resolve()
++    await flushPromises()
++    expect(wrapper.emitted('refresh')).toBeUndefined()
++    expect(wrapper.emitted('runFailed')).toBeUndefined()
++    expect(wrapper.get('[data-testid="model-trace-badge"]').text()).not.toContain('排队中')
++    wrapper.unmount()
++  })
++})
 diff --git a/frontend/src/components/user/monitor/__tests__/MonitorCard.modelTrace.spec.ts b/frontend/src/components/user/monitor/__tests__/MonitorCard.modelTrace.spec.ts
 new file mode 100644
 index 000000000..cf50f0508
@@ -8226,10 +9527,10 @@ index 000000000..cf50f0508
 +})
 diff --git a/frontend/src/composables/__tests__/useAccountTracePolling.spec.ts b/frontend/src/composables/__tests__/useAccountTracePolling.spec.ts
 new file mode 100644
-index 000000000..64d18a00a
+index 000000000..c734c521d
 --- /dev/null
 +++ b/frontend/src/composables/__tests__/useAccountTracePolling.spec.ts
-@@ -0,0 +1,211 @@
+@@ -0,0 +1,366 @@
 +import { flushPromises, mount } from '@vue/test-utils'
 +import { defineComponent, ref } from 'vue'
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -8240,14 +9541,16 @@ index 000000000..64d18a00a
 +  useAccountTracePolling,
 +} from '../useAccountTracePolling'
 +
-+const { getAdminAccountTraces, runAdminAccountTrace } = vi.hoisted(() => ({
++const { getAdminAccountTraces, runAdminAccountTrace, resetAdminAccountTrace } = vi.hoisted(() => ({
 +  getAdminAccountTraces: vi.fn(),
 +  runAdminAccountTrace: vi.fn(),
++  resetAdminAccountTrace: vi.fn(),
 +}))
 +let pageHidden = false
 +vi.mock('@/api/admin/modelTrace', () => ({
 +  getAdminAccountTraces,
 +  runAdminAccountTrace,
++  resetAdminAccountTrace,
 +}))
 +
 +function fakeAccountsResponse(overrides: any[] = []): AccountTraceListResponse {
@@ -8295,6 +9598,7 @@ index 000000000..64d18a00a
 +  vi.useFakeTimers()
 +  getAdminAccountTraces.mockReset().mockResolvedValue(fakeAccountsResponse())
 +  runAdminAccountTrace.mockReset().mockResolvedValue(undefined)
++  resetAdminAccountTrace.mockReset().mockResolvedValue(undefined)
 +  pageHidden = false
 +  vi.spyOn(document, 'hidden', 'get').mockImplementation(() => pageHidden)
 +})
@@ -8364,7 +9668,7 @@ index 000000000..64d18a00a
 +    wrapper.unmount()
 +  })
 +
-+  it('optimistic queued state and 3s interval upon calling runAccount', async () => {
++  it('settles an instant completion from a post-acceptance read without inventing a new result', async () => {
 +    const { wrapper, polling } = mountHarness()
 +    await flushPromises()
 +
@@ -8376,12 +9680,15 @@ index 000000000..64d18a00a
 +    await runPromise
 +    await flushPromises()
 +
-+    expect(runAdminAccountTrace).toHaveBeenCalledWith(17, undefined)
++    expect(runAdminAccountTrace).toHaveBeenCalledWith(17, undefined, expect.any(AbortSignal))
 +    // Run triggered immediate refresh
 +    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
 +
-+    // Advance 3s -> since optimisticQueued is still set, it polls again after 3s
++    expect(polling.stateFor(17).optimisticQueued).toBe(false)
++    expect(polling.stateFor(17).data?.latest?.checked_at).toBe('2026-09-24T12:00:00Z')
 +    await vi.advanceTimersByTimeAsync(ACCOUNT_TRACE_BUSY_INTERVAL_MS)
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    await vi.advanceTimersByTimeAsync(ACCOUNT_TRACE_DEFAULT_INTERVAL_MS - ACCOUNT_TRACE_BUSY_INTERVAL_MS)
 +    await flushPromises()
 +    expect(getAdminAccountTraces).toHaveBeenCalledTimes(3)
 +
@@ -8436,17 +9743,166 @@ index 000000000..64d18a00a
 +    await runPromise
 +    await flushPromises()
 +
-+    expect(runAdminAccountTrace).toHaveBeenCalledWith(101, 'gpt-5.6-sol')
++    expect(runAdminAccountTrace).toHaveBeenCalledWith(101, 'gpt-5.6-sol', expect.any(AbortSignal))
 +
 +    wrapper.unmount()
 +  })
 +})
++
++function deferred<T>() {
++  let resolve!: (value: T | PromiseLike<T>) => void
++  let reject!: (error: unknown) => void
++  const promise = new Promise<T>((ok, fail) => { resolve = ok; reject = fail })
++  return { promise, resolve, reject }
++}
++
++function readView(at: string): AccountTraceListResponse {
++  return { snapshot_at: at, accounts: fakeAccountsResponse().accounts.map(acc => ({ ...acc, snapshot_at: at })) }
++}
++
++describe('account trace mutation and read-view isolation', () => {
++  it('does not let a pre-POST GET block or overwrite the post-acceptance refresh', async () => {
++    const old = deferred<AccountTraceListResponse>()
++    const current = readView('2026-09-25T00:00:00.123456+00:00')
++    current.accounts[0].queued = true
++    current.accounts[0].next_model = 'gpt-5.6-sol'
++    getAdminAccountTraces.mockReturnValueOnce(old.promise).mockResolvedValue(current)
++    const { wrapper, polling } = mountHarness()
++    const signal = getAdminAccountTraces.mock.calls[0][0] as AbortSignal
++    await polling.runAccount(17, 'gpt-5.6-sol')
++    await flushPromises()
++    expect(signal.aborted).toBe(true)
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    expect(polling.stateFor(17)).toMatchObject({ optimisticQueued: false, data: { queued: true, running: false } })
++    old.resolve(fakeAccountsResponse())
++    await flushPromises()
++    expect(polling.stateFor(17).data?.queued).toBe(true)
++    await vi.advanceTimersByTimeAsync(ACCOUNT_TRACE_BUSY_INTERVAL_MS)
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(3)
++    wrapper.unmount()
++  })
++
++  it('keeps optimism during POST even if a refreshed historical result changes', async () => {
++    const post = deferred<void>()
++    runAdminAccountTrace.mockReturnValue(post.promise)
++    const { wrapper, polling } = mountHarness()
++    await flushPromises()
++    const run = polling.runAccount(17)
++    const historical = readView('2026-09-25T00:00:00.100000Z')
++    historical.accounts[0].latest!.checked_at = '2026-09-24T23:00:00Z'
++    getAdminAccountTraces.mockResolvedValue(historical)
++    await polling.refresh()
++    expect(polling.stateFor(17).optimisticQueued).toBe(true)
++    expect(polling.stateFor(17).data?.latest?.checked_at).toBe('2026-09-24T23:00:00Z')
++    post.resolve()
++    await run
++    await flushPromises()
++    expect(polling.stateFor(17).optimisticQueued).toBe(false)
++    expect(polling.stateFor(17).data?.latest?.checked_at).toBe('2026-09-24T23:00:00Z')
++    wrapper.unmount()
++  })
++
++  it('uses the batch microsecond watermark for empty lists and prevents resurrection', async () => {
++    const initial = readView('2026-09-25T00:00:00.123456+00:00')
++    getAdminAccountTraces.mockResolvedValue(initial)
++    const { wrapper, polling } = mountHarness()
++    await flushPromises()
++    getAdminAccountTraces.mockResolvedValue({ snapshot_at: '2026-09-25T00:00:00.123455+00:00', accounts: [] })
++    await polling.refresh()
++    expect(polling.stateFor(17).data).not.toBeNull()
++    getAdminAccountTraces.mockResolvedValue({ snapshot_at: '2026-09-25T00:00:00.123457+00:00', accounts: [] })
++    await polling.refresh()
++    expect(polling.stateFor(17).data).toBeNull()
++    getAdminAccountTraces.mockResolvedValue(initial)
++    await polling.refresh()
++    expect(polling.stateFor(17).data).toBeNull()
++    wrapper.unmount()
++  })
++
++  it('does not use checked_at as the read watermark or mistake historical results for a pending job', async () => {
++    getAdminAccountTraces.mockResolvedValue(readView('2026-09-25T00:00:00.123456Z'))
++    const { wrapper, polling } = mountHarness()
++    await flushPromises()
++    const fresh = readView('2026-09-25T00:00:00.123457Z')
++    fresh.accounts[0].latest!.checked_at = '2026-09-23T00:00:00Z'
++    fresh.accounts[0].queued = true
++    fresh.accounts[0].next_model = 'gpt-5.6-sol'
++    getAdminAccountTraces.mockResolvedValue(fresh)
++    await polling.refresh()
++    expect(polling.stateFor(17).data?.latest?.checked_at).toBe('2026-09-23T00:00:00Z')
++    expect(polling.stateFor(17).data?.queued).toBe(true)
++    expect(polling.stateFor(17).optimisticQueued).toBe(false)
++    wrapper.unmount()
++  })
++
++  it('supersedes a hung GET after visibility returns and ignores its late failure/finally', async () => {
++    const old = deferred<AccountTraceListResponse>()
++    const next = deferred<AccountTraceListResponse>()
++    getAdminAccountTraces.mockReturnValueOnce(old.promise).mockReturnValueOnce(next.promise)
++    const { wrapper, polling } = mountHarness()
++    polling.stateFor(17)
++    pageHidden = true
++    document.dispatchEvent(new Event('visibilitychange'))
++    pageHidden = false
++    document.dispatchEvent(new Event('visibilitychange'))
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    old.reject(new Error('old failure'))
++    await flushPromises()
++    expect(polling.stateFor(17)).toMatchObject({ loading: true, unavailable: false })
++    next.resolve(fakeAccountsResponse())
++    await flushPromises()
++    expect(polling.stateFor(17)).toMatchObject({ loading: false, unavailable: false })
++    wrapper.unmount()
++  })
++
++  it('forces a fresh GET after reset while an old GET remains unresolved', async () => {
++    const old = deferred<AccountTraceListResponse>()
++    getAdminAccountTraces.mockReturnValueOnce(old.promise).mockResolvedValue(fakeAccountsResponse())
++    const { wrapper, polling } = mountHarness()
++    await polling.resetAccount(17, 'gpt-5.6-sol')
++    await flushPromises()
++    expect(resetAdminAccountTrace).toHaveBeenCalledWith(17, 'gpt-5.6-sol', expect.any(AbortSignal))
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    const obsolete = fakeAccountsResponse()
++    obsolete.accounts[0].running = true
++    old.resolve(obsolete)
++    await flushPromises()
++    expect(polling.stateFor(17).data?.running).toBe(false)
++    wrapper.unmount()
++  })
++
++  it('does not leave optimism behind when an accepted target disappears from a fresh list', async () => {
++    const { wrapper, polling } = mountHarness()
++    await flushPromises()
++    getAdminAccountTraces.mockResolvedValue({ snapshot_at: '2026-09-25T00:00:00.123456Z', accounts: [] })
++    await polling.runAccount(17)
++    await flushPromises()
++    expect(polling.stateFor(17)).toMatchObject({ data: null, optimisticQueued: false })
++    wrapper.unmount()
++  })
++
++  it('aborts local submission on unmount and ignores an accepted late POST response', async () => {
++    const post = deferred<void>()
++    runAdminAccountTrace.mockReturnValueOnce(post.promise)
++    const { wrapper, polling } = mountHarness()
++    await flushPromises()
++    const run = polling.runAccount(17)
++    const signal = runAdminAccountTrace.mock.calls[0][2] as AbortSignal
++    wrapper.unmount()
++    expect(signal.aborted).toBe(true)
++    post.resolve()
++    await run
++    await flushPromises()
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(1)
++    expect(vi.getTimerCount()).toBe(0)
++  })
++})
 diff --git a/frontend/src/composables/__tests__/useModelTracePolling.spec.ts b/frontend/src/composables/__tests__/useModelTracePolling.spec.ts
 new file mode 100644
-index 000000000..04f7d8537
+index 000000000..bf4817d60
 --- /dev/null
 +++ b/frontend/src/composables/__tests__/useModelTracePolling.spec.ts
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,354 @@
 +import { flushPromises, mount } from '@vue/test-utils'
 +import { computed, defineComponent, ref } from 'vue'
 +import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
@@ -8461,7 +9917,9 @@ index 000000000..04f7d8537
 +
 +const { getModelTrace } = vi.hoisted(() => ({ getModelTrace: vi.fn() }))
 +let pageHidden = false
-+vi.mock('@/api/modelTrace', () => ({ getModelTrace }))
++vi.mock('@/api/modelTrace', async (importOriginal) => ({
++  ...await importOriginal<typeof import('@/api/modelTrace')>(), getModelTrace,
++}))
 +
 +function snapshot(id: number, model: string, overrides: Partial<TraceSnapshot> = {}): TraceSnapshot {
 +  return {
@@ -8708,13 +10166,105 @@ index 000000000..04f7d8537
 +    wrapper.unmount()
 +  })
 +})
++
++describe('ModelTrace scheduling and request isolation regressions', () => {
++  it('keeps backend activity independent of intermediate results and uses job timestamps', async () => {
++    const { wrapper, polling } = mountHarness([{ id: 1, model: 'gpt-6-astra' }])
++    await flushPromises()
++    const queuedAt = '2026-09-25T00:00:01Z'
++    const startedAt = '2026-09-25T00:00:03Z'
++    const round = { id: 8, status: 'suspect', target_probability: 0.1, best_model: null, checked_at: '2026-09-24T00:00:00Z', message_code: 'difference_signal', ranking: [] }
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-6-astra', { queued: true, queued_at: queuedAt, latest: round }))
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1)).toMatchObject({ queued: true, running: false, queuedAt: Date.parse(queuedAt), runningAt: null })
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-6-astra', { queued: false, running: true, queued_at: queuedAt, started_at: startedAt, latest: { ...round, checked_at: '2026-09-25T00:00:02Z' } }))
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1)).toMatchObject({ queued: false, running: true, runningAt: Date.parse(startedAt) })
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-6-astra', { queued: true, running: false, latest: round }))
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1)).toMatchObject({ queued: true, running: false })
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-6-astra', { queued: false, running: false, latest: round }))
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1)).toMatchObject({ queued: false, running: false, runningAt: null, queuedAt: null })
++    expect(vi.getTimerCount()).toBe(1)
++    wrapper.unmount()
++  })
++
++  it('immediately fetches a replacement model even if the old request ignores abort', async () => {
++    const old = deferred<TraceSnapshot>()
++    getModelTrace.mockReturnValueOnce(old.promise)
++    const { wrapper, polling, targets } = mountHarness([{ id: 1, model: 'gpt-6-astra' }])
++    const oldSignal = getModelTrace.mock.calls[0][1] as AbortSignal
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-5.6-sol', { queued: false }))
++    targets.value = [{ id: 1, model: 'gpt-5.6-sol' }]
++    await flushPromises()
++    expect(oldSignal.aborted).toBe(true)
++    expect(getModelTrace).toHaveBeenCalledTimes(2)
++    expect(polling.stateFor(1).snapshot?.model).toBe('gpt-5.6-sol')
++    old.resolve(snapshot(1, 'gpt-6-astra', { running: true }))
++    await flushPromises()
++    expect(polling.stateFor(1)).toMatchObject({ mappingMismatch: false, running: false, snapshot: { model: 'gpt-5.6-sol' } })
++    wrapper.unmount()
++  })
++
++  it('invalidates pre-submit GETs without letting their unresolved batch block later polling', async () => {
++    const old = deferred<TraceSnapshot>()
++    getModelTrace.mockReturnValueOnce(old.promise)
++    const { wrapper, polling } = mountHarness([{ id: 1, model: 'gpt-6-astra' }])
++    polling.notifyRunSubmitted(1)
++    expect(polling.stateFor(1).queued).toBe(true)
++    getModelTrace.mockResolvedValue(snapshot(1, 'gpt-6-astra', { queued: false }))
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1).queued).toBe(false)
++    await vi.advanceTimersByTimeAsync(MODEL_TRACE_POLL_INTERVAL_MS)
++    expect(getModelTrace).toHaveBeenCalledTimes(3)
++    old.resolve(snapshot(1, 'gpt-6-astra', { running: true }))
++    await flushPromises()
++    expect(polling.stateFor(1).running).toBe(false)
++    wrapper.unmount()
++  })
++
++  it('rejects an older microsecond read view but accepts a fresh view of older historical results', async () => {
++    const first = snapshot(1, 'gpt-6-astra', { snapshot_at: '2026-09-25T00:00:00.123456+00:00', running: true, queued: false, last_checked_at: '2026-09-24T00:00:00Z' })
++    getModelTrace.mockResolvedValue(first)
++    const { wrapper, polling } = mountHarness([{ id: 1, model: 'gpt-6-astra' }])
++    await flushPromises()
++    getModelTrace.mockResolvedValue({ ...first, snapshot_at: '2026-09-25T00:00:00.123455+00:00', running: false, last_checked_at: '2026-09-25T00:00:00Z' })
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1).running).toBe(true)
++    expect(polling.stateFor(1).snapshot?.last_checked_at).toBe('2026-09-24T00:00:00Z')
++    getModelTrace.mockResolvedValue({ ...first, snapshot_at: '2026-09-25T00:00:00.123457+00:00', running: false, last_checked_at: '2026-09-23T00:00:00Z' })
++    await polling.refreshMonitor(1)
++    expect(polling.stateFor(1).running).toBe(false)
++    expect(polling.stateFor(1).snapshot?.last_checked_at).toBe('2026-09-23T00:00:00Z')
++    wrapper.unmount()
++  })
++})
++
++it('retains a read watermark through transient errors instead of accepting an older recovery response', async () => {
++  const fresh = snapshot(1, 'gpt-6-astra', { snapshot_at: '2026-09-25T00:00:00.123456Z', queued: false })
++  getModelTrace.mockResolvedValue(fresh)
++  const { wrapper, polling } = mountHarness([{ id: 1, model: 'gpt-6-astra' }])
++  await flushPromises()
++  getModelTrace.mockRejectedValueOnce(new Error('temporary network failure'))
++  await polling.refreshMonitor(1)
++  expect(polling.stateFor(1).unavailable).toBe(true)
++  getModelTrace.mockResolvedValue({ ...fresh, snapshot_at: '2026-09-25T00:00:00.123455Z', running: true })
++  await polling.refreshMonitor(1)
++  expect(polling.stateFor(1)).toMatchObject({ unavailable: true, snapshot: null, running: false })
++  getModelTrace.mockResolvedValue({ ...fresh, snapshot_at: '2026-09-25T00:00:00.123457Z' })
++  await polling.refreshMonitor(1)
++  expect(polling.stateFor(1).unavailable).toBe(false)
++  wrapper.unmount()
++})
 diff --git a/frontend/src/composables/useAccountTracePolling.ts b/frontend/src/composables/useAccountTracePolling.ts
 new file mode 100644
-index 000000000..6c1a01792
+index 000000000..2a65fd511
 --- /dev/null
 +++ b/frontend/src/composables/useAccountTracePolling.ts
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,314 @@
 +import { onBeforeUnmount, onMounted, reactive, watch, type Ref } from 'vue'
++import { isOlderTraceSnapshot } from '@/api/modelTrace'
 +import {
 +  getAdminAccountTraces,
 +  resetAdminAccountTrace,
@@ -8757,19 +10307,26 @@ index 000000000..6c1a01792
 +  return value.name === 'AbortError' || value.code === 'ERR_CANCELED'
 +}
 +
++interface PendingRun {
++  controller: AbortController
++  accepted: boolean
++  accountIds: number[]
++}
++
 +export function useAccountTracePolling(
 +  enabledRef?: Ref<boolean>,
 +): UseAccountTracePollingResult {
 +  const traceMap = reactive(new Map<number, AccountTraceItem>())
 +  const states = reactive(new Map<number, AccountTraceState>())
 +  // Track optimistic queued account IDs
-+  const pendingRuns = reactive(new Set<number>())
++  const pendingRuns = new Map<number, PendingRun>()
++  const actionControllers = new Set<AbortController>()
 +
 +  let pollTimer: ReturnType<typeof setTimeout> | undefined
 +  let currentController: AbortController | null = null
 +  let enabled = enabledRef ? enabledRef.value : true
 +  let disposed = false
-+  let cyclePromise: Promise<void> | null = null
++  let lastSnapshotAt: string | undefined
 +
 +  const isHidden = () => typeof document !== 'undefined' && document.hidden
 +
@@ -8808,20 +10365,7 @@ index 000000000..6c1a01792
 +  }
 +
 +  function isOptimisticQueued(accountId: number): boolean {
-+    if (pendingRuns.has(accountId)) return true
-+    for (const pendingId of pendingRuns) {
-+      const pendingItem = traceMap.get(pendingId)
-+      if (pendingItem?.member_account_ids?.includes(accountId)) {
-+        return true
-+      }
-+    }
-+    const currentItem = traceMap.get(accountId)
-+    if (currentItem?.member_account_ids) {
-+      for (const mId of currentItem.member_account_ids) {
-+        if (pendingRuns.has(mId)) return true
-+      }
-+    }
-+    return false
++    return [...pendingRuns.values()].some(run => run.accountIds.includes(accountId))
 +  }
 +
 +  function updateOptimisticQueuedStates(): void {
@@ -8830,113 +10374,139 @@ index 000000000..6c1a01792
 +    }
 +  }
 +
++  function cancelRefresh(): void {
++    currentController?.abort()
++    currentController = null
++    for (const state of states.values()) state.loading = false
++  }
++
 +  async function refresh(): Promise<void> {
-+    if (!enabled || disposed || isHidden() || cyclePromise) return
-+    if (currentController) currentController.abort()
++    if (!enabled || disposed || isHidden()) return
++    clearPollTimer()
++    cancelRefresh()
 +    const controller = new AbortController()
 +    currentController = controller
++    // Only a GET begun after POST acceptance may settle local optimism.
++    // Historical checked_at is never evidence that this new job finished.
++    const acceptedRuns = new Map([...pendingRuns].filter(([, run]) => run.accepted))
 +
 +    for (const state of states.values()) {
 +      state.loading = true
 +    }
 +
-+    const promise = (async () => {
-+      try {
-+        const res = await getAdminAccountTraces(controller.signal)
-+        if (disposed || controller.signal.aborted || currentController !== controller) return
++    try {
++      const res = await getAdminAccountTraces(controller.signal)
++      if (disposed || controller.signal.aborted || currentController !== controller) return
++      if (isOlderTraceSnapshot(res.snapshot_at, lastSnapshotAt)) return
++      for (const acc of res.accounts || []) {
++        const existing = traceMap.get(acc.account_id)
++          ?? acc.member_account_ids?.map(id => traceMap.get(id)).find(Boolean)
++        // Do not apply an older read view, including its membership deletions.
++        if (isOlderTraceSnapshot(acc.snapshot_at ?? res.snapshot_at, existing?.snapshot_at)) return
++      }
++      lastSnapshotAt = res.snapshot_at
 +
-+        traceMap.clear()
-+        const receivedIds = new Set<number>()
-+        for (const acc of res.accounts || []) {
-+          // One entry per upstream: every member key id resolves to it, so the
-+          // account page can look the upstream up by any of its keys.
-+          const ids = Array.isArray(acc.member_account_ids) && acc.member_account_ids.length > 0
-+            ? acc.member_account_ids
-+            : [acc.account_id]
-+          for (const id of ids) {
-+            traceMap.set(id, acc)
-+            receivedIds.add(id)
-+            const state = getOrCreateState(id)
-+            state.data = acc
-+            state.unavailable = false
-+          }
-+
-+          // If the backend has acknowledged running/queued or completed after pending,
-+          // we can clear pendingRun for this account and its cluster members
-+          if (acc.running || acc.queued) {
-+            pendingRuns.delete(acc.account_id)
-+            if (Array.isArray(acc.member_account_ids)) {
-+              for (const memberId of acc.member_account_ids) {
-+                pendingRuns.delete(memberId)
-+              }
-+            }
-+          }
-+        }
-+
-+        // For accounts in states that weren't returned:
-+        for (const [id, state] of states.entries()) {
-+          if (!receivedIds.has(id)) {
-+            state.data = null
-+            state.unavailable = false
-+          }
-+        }
-+        updateOptimisticQueuedStates()
-+      } catch (err: unknown) {
-+        if (disposed || controller.signal.aborted || currentController !== controller) return
-+        if (isAbortError(err)) return
-+        for (const state of states.values()) {
-+          state.unavailable = true
-+        }
-+      } finally {
-+        if (currentController === controller) {
-+          currentController = null
-+          for (const state of states.values()) {
-+            state.loading = false
-+          }
-+          schedulePoll()
++      traceMap.clear()
++      const receivedIds = new Set<number>()
++      for (const acc of res.accounts || []) {
++        // One entry per upstream: every member key id resolves to it, so the
++        // account page can look the upstream up by any of its keys.
++        const ids = [...new Set([acc.account_id, ...(acc.member_account_ids || [])])]
++        for (const id of ids) {
++          traceMap.set(id, acc)
++          receivedIds.add(id)
++          const state = getOrCreateState(id)
++          state.data = acc
++          state.unavailable = false
 +        }
 +      }
-+    })()
++      // Fresh idle (or removed) targets also settle an accepted job, even
++      // when it finished between polls without producing a scored result.
++      for (const [id, run] of acceptedRuns) {
++        if (pendingRuns.get(id) === run) pendingRuns.delete(id)
++      }
 +
-+    cyclePromise = promise
-+    try {
-+      await promise
++      // For accounts in states that weren't returned:
++      for (const [id, state] of states.entries()) {
++        if (!receivedIds.has(id)) {
++          state.data = null
++          state.unavailable = false
++        }
++      }
++      updateOptimisticQueuedStates()
++    } catch (err: unknown) {
++      if (disposed || controller.signal.aborted || currentController !== controller) return
++      if (isAbortError(err)) return
++      for (const state of states.values()) {
++        state.unavailable = true
++      }
 +    } finally {
-+      cyclePromise = null
++      if (currentController === controller) {
++        currentController = null
++        for (const state of states.values()) {
++          state.loading = false
++        }
++        schedulePoll()
++      }
 +    }
 +  }
 +
 +  async function runAccount(accountId: number, model?: string): Promise<void> {
-+    if (disposed) return
-+    pendingRuns.add(accountId)
++    if (disposed || isOptimisticQueued(accountId)) return
++    cancelRefresh()
 +    // Also add cluster members if known
 +    const item = traceMap.get(accountId)
-+    const affectedIds = [accountId]
++    const affectedIds = [accountId, ...(item ? [item.account_id] : [])]
 +    if (item?.member_account_ids) {
 +      for (const mId of item.member_account_ids) {
 +        affectedIds.push(mId)
 +      }
 +    }
-+    for (const id of affectedIds) {
++    const controller = new AbortController()
++    const run: PendingRun = { controller, accepted: false, accountIds: [...new Set(affectedIds)] }
++    pendingRuns.set(accountId, run)
++    actionControllers.add(controller)
++    for (const id of run.accountIds) {
 +      const state = getOrCreateState(id)
 +      state.optimisticQueued = true
 +    }
 +
 +    try {
-+      await runAdminAccountTrace(accountId, model)
++      await runAdminAccountTrace(accountId, model, controller.signal)
++      if (disposed || controller.signal.aborted || pendingRuns.get(accountId) !== run) return
++      run.accepted = true
++      // Invalidate a GET that raced the POST, even if the page is hidden.
++      cancelRefresh()
 +      // On success, trigger polling immediately (3s or immediate)
 +      void refresh()
 +    } catch (err) {
++      if (disposed || controller.signal.aborted || pendingRuns.get(accountId) !== run) return
 +      pendingRuns.delete(accountId)
 +      updateOptimisticQueuedStates()
++      void refresh()
 +      throw err
++    } finally {
++      actionControllers.delete(controller)
 +    }
 +  }
 +
 +  async function resetAccount(accountId: number, model: string): Promise<void> {
 +    if (disposed) return
-+    await resetAdminAccountTrace(accountId, model)
-+    void refresh()
++    const controller = new AbortController()
++    actionControllers.add(controller)
++    cancelRefresh()
++    try {
++      await resetAdminAccountTrace(accountId, model, controller.signal)
++      if (disposed || controller.signal.aborted) return
++      cancelRefresh()
++      void refresh()
++    } catch (err) {
++      if (disposed || controller.signal.aborted) return
++      void refresh()
++      throw err
++    } finally {
++      actionControllers.delete(controller)
++    }
 +  }
 +
 +  function stateFor(accountId: number): AccountTraceState {
@@ -8950,25 +10520,19 @@ index 000000000..6c1a01792
 +  function start(): void {
 +    if (disposed) return
 +    enabled = true
-+    if (!isHidden()) void refresh()
++    if (!isHidden() && !currentController) void refresh()
 +  }
 +
 +  function stop(): void {
 +    enabled = false
 +    clearPollTimer()
-+    if (currentController) {
-+      currentController.abort()
-+      currentController = null
-+    }
++    cancelRefresh()
 +  }
 +
 +  function handleVisibilityChange(): void {
 +    if (isHidden()) {
 +      clearPollTimer()
-+      if (currentController) {
-+        currentController.abort()
-+        currentController = null
-+      }
++      cancelRefresh()
 +    } else if (enabled) {
 +      void refresh()
 +    }
@@ -8994,6 +10558,9 @@ index 000000000..6c1a01792
 +
 +  onBeforeUnmount(() => {
 +    disposed = true
++    for (const controller of actionControllers) controller.abort()
++    actionControllers.clear()
++    pendingRuns.clear()
 +    if (typeof document !== 'undefined') {
 +      document.removeEventListener('visibilitychange', handleVisibilityChange)
 +    }
@@ -9012,12 +10579,12 @@ index 000000000..6c1a01792
 +}
 diff --git a/frontend/src/composables/useModelTracePolling.ts b/frontend/src/composables/useModelTracePolling.ts
 new file mode 100644
-index 000000000..9844ae66e
+index 000000000..76b3ea8d0
 --- /dev/null
 +++ b/frontend/src/composables/useModelTracePolling.ts
-@@ -0,0 +1,411 @@
+@@ -0,0 +1,441 @@
 +import { onBeforeUnmount, onMounted, reactive, watch, type Ref } from 'vue'
-+import { getModelTrace, type TraceSnapshot } from '@/api/modelTrace'
++import { getModelTrace, isOlderTraceSnapshot, type TraceSnapshot } from '@/api/modelTrace'
 +
 +/** ModelTrace is hour-level data; normal refresh is 5 minutes. */
 +export const MODEL_TRACE_POLL_INTERVAL_MS = 5 * 60 * 1000
@@ -9076,6 +10643,11 @@ index 000000000..9844ae66e
 +  return value.name === 'AbortError' || value.code === 'ERR_CANCELED'
 +}
 +
++function timestamp(value: string | null | undefined): number | undefined {
++  const parsed = value ? Date.parse(value) : NaN
++  return Number.isFinite(parsed) ? parsed : undefined
++}
++
 +/**
 + * Owns one page-level ModelTrace cache and timers for all cards on the page.
 + * Fast-polls active (queued or running) monitors without disturbing normal cards.
@@ -9086,6 +10658,8 @@ index 000000000..9844ae66e
 +  const states = reactive(new Map<number, ModelTraceState>())
 +  const activeRuns = new Map<number, ModelTraceActiveRun>()
 +  const controllers = new Map<number, AbortController>()
++  const targetModels = new Map<number, string>()
++  const snapshotWatermarks = new Map<number, string>()
 +  let pollTimer: ReturnType<typeof setTimeout> | undefined
 +  const activeTimers = new Map<number, ReturnType<typeof setTimeout>>()
 +  let cyclePromise: Promise<void> | null = null
@@ -9099,7 +10673,7 @@ index 000000000..9844ae66e
 +  function targetMap(): Map<number, ModelTracePollTarget> {
 +    const result = new Map<number, ModelTracePollTarget>()
 +    for (const target of targets.value) {
-+      if (!result.has(target.id)) result.set(target.id, target)
++      if (!result.has(target.id)) result.set(target.id, { id: target.id, model: target.model })
 +    }
 +    return result
 +  }
@@ -9121,7 +10695,19 @@ index 000000000..9844ae66e
 +
 +  function syncTargets(): void {
 +    const current = targetMap()
-+    targetRevision += 1
++    let changed = false
++    for (const [monitorId, model] of targetModels) {
++      if (current.get(monitorId)?.model !== model) {
++        changed = true
++        controllers.get(monitorId)?.abort()
++        controllers.delete(monitorId)
++        states.delete(monitorId)
++        activeRuns.delete(monitorId)
++        clearActiveTimer(monitorId)
++        targetModels.delete(monitorId)
++        snapshotWatermarks.delete(monitorId)
++      }
++    }
 +
 +    for (const [monitorId, controller] of controllers) {
 +      if (!current.has(monitorId)) {
@@ -9136,8 +10722,18 @@ index 000000000..9844ae66e
 +        clearActiveTimer(monitorId)
 +      }
 +    }
-+    for (const monitorId of current.keys()) {
++    for (const [monitorId, target] of current) {
++      if (!targetModels.has(monitorId)) {
++        changed = true
++        targetModels.set(monitorId, target.model)
++      }
 +      if (!states.has(monitorId)) states.set(monitorId, createState())
++    }
++    if (changed) {
++      targetRevision += 1
++      // An ignored/slow abort must not block fetching the replacement target.
++      cycleGeneration += 1
++      cyclePromise = null
 +    }
 +  }
 +
@@ -9200,50 +10796,30 @@ index 000000000..9844ae66e
 +    let run = activeRuns.get(target.id)
 +    const latestCheckedAt = snapshot.latest?.checked_at ?? null
 +
-+    if (run) {
-+      const checkedAtChanged = run.baselineCheckedAt !== undefined && latestCheckedAt !== run.baselineCheckedAt
-+      if (checkedAtChanged || (!snapshot.running && run.runningAt !== undefined)) {
-+        // Run has finished: latest.checked_at changed or running became false
-+        activeRuns.delete(target.id)
-+        clearActiveTimer(target.id)
-+        state.queued = false
-+        state.running = false
-+        state.queuedAt = null
-+        state.runningAt = null
-+        return
-+      }
-+
-+      if (snapshot.running) {
-+        if (!run.runningAt) {
-+          run.runningAt = Date.now()
-+        }
-+        state.queued = false
-+        state.running = true
-+        state.queuedAt = run.queuedAt
-+        state.runningAt = run.runningAt
-+      } else {
-+        // Still waiting for backend worker to pick up the task
-+        state.queued = true
-+        state.running = false
-+        state.queuedAt = run.queuedAt
-+        state.runningAt = null
-+      }
-+      scheduleActivePoll(target.id)
-+    } else if (snapshot.running) {
-+      // Detected running from regular poll without local submission
++    // Job activity is authoritative even if a new historical round arrives
++    // during a multi-round retest. A result is not a job-completion signal.
++    if (snapshot.running || snapshot.queued) {
 +      const now = Date.now()
-+      run = {
-+        queuedAt: now,
-+        runningAt: now,
-+        baselineCheckedAt: latestCheckedAt,
-+      }
++      run ??= { queuedAt: now, baselineCheckedAt: latestCheckedAt }
++      run.queuedAt = timestamp(snapshot.queued_at) ?? run.queuedAt
++      run.runningAt = snapshot.running ? (timestamp(snapshot.started_at) ?? run.runningAt ?? now) : undefined
 +      activeRuns.set(target.id, run)
-+      state.queued = false
-+      state.running = true
-+      state.queuedAt = null
-+      state.runningAt = now
++      state.queued = !snapshot.running
++      state.running = snapshot.running
++      state.queuedAt = run.queuedAt
++      state.runningAt = run.runningAt ?? null
++      scheduleActivePoll(target.id)
++    } else if (run && snapshot.queued === undefined && run.runningAt === undefined
++      && latestCheckedAt === run.baselineCheckedAt) {
++      // Compatibility for old sidecars that do not expose queue state.
++      state.queued = true
++      state.running = false
++      state.queuedAt = run.queuedAt
++      state.runningAt = null
 +      scheduleActivePoll(target.id)
 +    } else {
++      activeRuns.delete(target.id)
++      clearActiveTimer(target.id)
 +      state.queued = false
 +      state.running = false
 +      state.queuedAt = null
@@ -9264,6 +10840,9 @@ index 000000000..9844ae66e
 +    try {
 +      const result = await getModelTrace(target.id, controller.signal)
 +      if (disposed || controller.signal.aborted || controllers.get(target.id) !== controller) return
++      // A later request can still return an older DB read view. Compare the
++      // snapshot watermark, not latest.checked_at (which can stay unchanged).
++      if (isOlderTraceSnapshot(result.snapshot_at, snapshotWatermarks.get(target.id))) return
 +
 +      const mismatch = result.monitor_id !== target.id || result.model !== target.model
 +      state.snapshot = mismatch ? null : result
@@ -9271,6 +10850,7 @@ index 000000000..9844ae66e
 +      state.unavailable = false
 +
 +      if (!mismatch) {
++        if (timestamp(result.snapshot_at) !== undefined) snapshotWatermarks.set(target.id, result.snapshot_at!)
 +        updateActiveStateFromSnapshot(target, result)
 +      } else {
 +        activeRuns.delete(target.id)
@@ -9336,13 +10916,24 @@ index 000000000..9844ae66e
 +    if (disposed || isHidden()) return
 +    const target = targetMap().get(monitorId)
 +    if (!target) return
++    if (controllers.has(monitorId)) {
++      cycleGeneration += 1
++      cyclePromise = null
++    }
 +    await refreshOne(target)
 +    if (enabled && !activeRuns.has(monitorId)) schedulePoll()
 +  }
 +
 +  function notifyRunSubmitted(monitorId: number): void {
++    if (disposed || !targetMap().has(monitorId)) return
++    // A GET started before this mutation cannot acknowledge or finish it.
++    controllers.get(monitorId)?.abort()
++    controllers.delete(monitorId)
++    cycleGeneration += 1
++    cyclePromise = null
 +    const state = states.get(monitorId) ?? createState()
 +    states.set(monitorId, state)
++    state.loading = false
 +    const now = Date.now()
 +    const baselineCheckedAt = state.snapshot?.latest?.checked_at ?? null
 +
@@ -9359,6 +10950,12 @@ index 000000000..9844ae66e
 +  }
 +
 +  function notifyRunFailed(monitorId: number): void {
++    const target = targetMap().get(monitorId)
++    const snapshot = states.get(monitorId)?.snapshot
++    if (target && snapshot && (snapshot.running || snapshot.queued)) {
++      updateActiveStateFromSnapshot(target, snapshot)
++      return
++    }
 +    activeRuns.delete(monitorId)
 +    clearActiveTimer(monitorId)
 +    const state = states.get(monitorId)
@@ -9403,7 +11000,7 @@ index 000000000..9844ae66e
 +      syncTargets()
 +      if (enabled && !isHidden()) void refreshAll()
 +    },
-+    { immediate: true },
++    { immediate: true, deep: true, flush: 'sync' },
 +  )
 +
 +  onMounted(() => {
@@ -9464,7 +11061,7 @@ index 01ee00f10..a177d476b 100644
    top: number | null
    bottom: number | null
 diff --git a/frontend/src/views/admin/AccountsView.vue b/frontend/src/views/admin/AccountsView.vue
-index 5df2c8afa..b168a078e 100644
+index 5df2c8afa..7e4f89480 100644
 --- a/frontend/src/views/admin/AccountsView.vue
 +++ b/frontend/src/views/admin/AccountsView.vue
 @@ -287,8 +287,28 @@
@@ -9507,7 +11104,7 @@ index 5df2c8afa..b168a078e 100644
  import AccountUsageCell from '@/components/account/AccountUsageCell.vue'
  import AccountTodayStatsCell from '@/components/account/AccountTodayStatsCell.vue'
  import AccountGroupsCell from '@/components/account/AccountGroupsCell.vue'
-@@ -535,6 +557,11 @@ import { formatMultiplier } from '@/utils/formatters'
+@@ -535,6 +557,12 @@ import { formatMultiplier } from '@/utils/formatters'
  import type { Account, AccountListItem, AccountPlatform, AccountSchedulerGroupScore, AccountType, AccountUsageInfo, Proxy as AccountProxy, AdminGroup, WindowStats, ClaudeModel, UpstreamBillingProbeSnapshot } from '@/types'
  
  const { t } = useI18n()
@@ -9515,20 +11112,43 @@ index 5df2c8afa..b168a078e 100644
 +  stateFor: accountTraceFor,
 +  runAccount: runAccountTrace,
 +  resetAccount: resetAccountTrace,
++  refresh: refreshAccountTraces,
 +} = useAccountTracePolling()
  const appStore = useAppStore()
  const authStore = useAuthStore()
  
+@@ -2119,6 +2147,7 @@ const handleBulkUpdated = () => {
+   showBulkEdit.value = false
+   bulkEditTarget.value = null
+   clearSelection()
++  void refreshAccountTraces()
+   reload()
+ }
+ const handleDataImported = () => { showImportData.value = false; reload() }
+@@ -2251,6 +2280,9 @@ const handleProbeUpstreamBilling = async (account: Account) => {
+ const handleAccountUpdated = (updatedAccount: Account) => {
+   patchAccountInList(updatedAccount)
+   enterAutoRefreshSilentWindow()
++  // ModelTrace owns a separate snapshot: refetch after persistence, not from
++  // the draft whitelist. refresh() also supersedes any pre-save GET.
++  void refreshAccountTraces()
+ }
+ const formatExportTimestamp = () => {
+   const now = new Date()
 diff --git a/frontend/src/views/admin/__tests__/AccountsView.modelTrace.spec.ts b/frontend/src/views/admin/__tests__/AccountsView.modelTrace.spec.ts
 new file mode 100644
-index 000000000..94901f4f4
+index 000000000..586ad80e5
 --- /dev/null
 +++ b/frontend/src/views/admin/__tests__/AccountsView.modelTrace.spec.ts
-@@ -0,0 +1,213 @@
-+import { describe, expect, it, vi, beforeEach } from 'vitest'
-+import { flushPromises, mount } from '@vue/test-utils'
+@@ -0,0 +1,321 @@
++import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
++import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 +import AccountsView from '../AccountsView.vue'
 +import type { AccountListItem } from '@/types'
++import type { AccountTraceListResponse } from '@/api/admin/modelTrace'
++import { ACCOUNT_TRACE_DEFAULT_INTERVAL_MS } from '@/composables/useAccountTracePolling'
++
++enableAutoUnmount(afterEach)
 +
 +const {
 +  listAccounts,
@@ -9631,6 +11251,7 @@ index 000000000..94901f4f4
 +const mountView = () => mount(AccountsView, {
 +  global: {
 +    stubs: {
++      teleport: true,
 +      AppLayout: { template: '<div><slot /></div>' },
 +      TablePageLayout: {
 +        template: '<div><slot name="filters" /><slot name="table" /><slot name="pagination" /></div>',
@@ -9639,7 +11260,6 @@ index 000000000..94901f4f4
 +      Pagination: true,
 +      ConfirmDialog: true,
 +      AccountStatusIndicator: { template: '<div data-test="account-status">status</div>' },
-+      UpstreamKeysModal: true,
 +      EditAccountModal: true,
 +      AccountTableActions: true,
 +      AccountTableFilters: true,
@@ -9663,6 +11283,7 @@ index 000000000..94901f4f4
 +describe('AccountsView ModelTrace consistency badges', () => {
 +  beforeEach(() => {
 +    vi.clearAllMocks()
++    getAdminAccountTraces.mockReset()
 +    getAllProxies.mockResolvedValue([])
 +    getAllGroups.mockResolvedValue([])
 +    getBatchTodayStats.mockResolvedValue({ stats: {} })
@@ -9736,6 +11357,109 @@ index 000000000..94901f4f4
 +
 +    const row18 = wrapper.find('[data-test="row-18"]')
 +    expect(row18.find('[data-testid="account-trace-badge"]').exists()).toBe(false)
++  })
++})
++
++function account42() {
++  return {
++    id: 42, name: '231', platform: 'openai', type: 'oauth', status: 'active',
++    schedulable: true, concurrency: 5, created_at: '2026-09-26T00:00:00Z', updated_at: '2026-09-26T00:00:00Z',
++    credentials: { model_mapping: { 'gpt-6-astra': 'gpt-6-astra' } },
++  }
++}
++
++function trace42(models = ['gpt-6-astra'], at = '2026-09-26T02:55:34.000001Z'): AccountTraceListResponse {
++  return { snapshot_at: at, accounts: [{
++    account_id: 42, name: '231', models, snapshot_at: at, mode: 'active', interval_seconds: 300,
++    last_real_request_at: null, next_run_at: null, running: false, queued: false,
++    latest: { model: 'gpt-6-astra', status: 'match', message_code: 'compatible', target_probability: 0.8,
++      best_model: null, checked_at: '2026-09-26T02:50:00Z' }, history: [],
++  }] }
++}
++
++function seedAccount42() {
++  vi.clearAllMocks()
++  getAllProxies.mockResolvedValue([])
++  getAllGroups.mockResolvedValue([])
++  getBatchTodayStats.mockResolvedValue({ stats: {} })
++  getUpstreamBillingProbeSettings.mockResolvedValue({ enabled: false })
++  listAccounts.mockResolvedValue({ items: [account42()], total: 1, page: 1, page_size: 20, pages: 1 })
++  getAdminAccountTraces.mockReset().mockResolvedValue(trace42())
++}
++
++const supportedModels = ['gpt-6-astra', 'gpt-5.6-sol', 'gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.5']
++const savedAccount42 = () => ({ ...account42(), credentials: {
++  model_mapping: Object.fromEntries([...supportedModels, 'codex-auto-review', 'gpt-reserve'].map(model => [model, model])),
++} })
++const modelOptions = (wrapper: ReturnType<typeof mountView>) =>
++  wrapper.get('[data-testid="trace-model-select"]').findAll('option').map(option => option.element.value)
++
++describe('AccountsView saved model restrictions', () => {
++  beforeEach(seedAccount42)
++  afterEach(() => vi.useRealTimers())
++
++  it('immediately refreshes an already-open trace popover after a successful account save', async () => {
++    const wrapper = mountView()
++    await flushPromises()
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    expect(modelOptions(wrapper)).toEqual(['gpt-6-astra'])
++    getAdminAccountTraces.mockResolvedValue(trace42(supportedModels, '2026-09-26T02:55:34.000002Z'))
++
++    wrapper.findComponent({ name: 'EditAccountModal' }).vm.$emit('updated', savedAccount42())
++    await flushPromises()
++
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    expect(modelOptions(wrapper)).toEqual(supportedModels)
++    expect(wrapper.get<HTMLSelectElement>('[data-testid="trace-model-select"]').element.value).toBe('gpt-6-astra')
++    const rows = wrapper.findAll('[data-testid="popover-model-row"]')
++    expect(rows).toHaveLength(5)
++    for (const row of rows.slice(1)) {
++      expect(row.get('[data-testid="popover-model-conclusion"]').text()).toBe('未检测')
++    }
++    expect(rows[0].get('[data-testid="popover-model-conclusion"]').text()).toContain('一致')
++    expect(runAdminAccountTrace).not.toHaveBeenCalled()
++  })
++
++  it.each(['BulkEditAccountModal'])('refreshes trace targets when %s reports a saved update', async (modalName) => {
++    const wrapper = mountView()
++    await flushPromises()
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    getAdminAccountTraces.mockResolvedValue(trace42(supportedModels, '2026-09-26T02:55:34.000002Z'))
++    wrapper.findComponent({ name: modalName }).vm.$emit('updated')
++    await flushPromises()
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(2)
++    expect(modelOptions(wrapper)).toEqual(supportedModels)
++  })
++
++  it('does not invalidate trace models when an editor closes without a saved update', async () => {
++    const wrapper = mountView()
++    await flushPromises()
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    wrapper.findComponent({ name: 'EditAccountModal' }).vm.$emit('close')
++    await flushPromises()
++    expect(getAdminAccountTraces).toHaveBeenCalledTimes(1)
++    expect(modelOptions(wrapper)).toEqual(['gpt-6-astra'])
++  })
++
++  it('aborts a pre-save poll and ignores its late response after fresh models arrive', async () => {
++    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] })
++    const wrapper = mountView()
++    await flushPromises()
++    await wrapper.get('[data-testid="account-trace-badge"]').trigger('click')
++    let resolveOld!: (value: AccountTraceListResponse) => void
++    getAdminAccountTraces.mockImplementationOnce(() => new Promise<AccountTraceListResponse>(resolve => { resolveOld = resolve }))
++    await vi.advanceTimersByTimeAsync(ACCOUNT_TRACE_DEFAULT_INTERVAL_MS)
++    const oldSignal = getAdminAccountTraces.mock.calls[1][0] as AbortSignal
++    getAdminAccountTraces.mockResolvedValue(trace42(supportedModels, '2026-09-26T02:55:34.000002Z'))
++
++    wrapper.findComponent({ name: 'EditAccountModal' }).vm.$emit('updated', savedAccount42())
++    await flushPromises()
++    expect(oldSignal.aborted).toBe(true)
++    expect(modelOptions(wrapper)).toEqual(supportedModels)
++    // Even a late payload with a misleading newer timestamp cannot win an aborted request.
++    resolveOld(trace42(['gpt-6-astra'], '2026-09-26T02:55:34.000003Z'))
++    await flushPromises()
++    expect(modelOptions(wrapper)).toEqual(supportedModels)
 +  })
 +})
 diff --git a/frontend/src/views/user/ChannelStatusV1View.vue b/frontend/src/views/user/ChannelStatusV1View.vue

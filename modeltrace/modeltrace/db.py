@@ -6,6 +6,7 @@ import math
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -114,6 +115,7 @@ class ModelTraceDB:
         cluster_name: str | None = None,
         real_models: list[str] | None = None,
         paused_models: list[dict[str, Any]] | None = None,
+        inactive_reason: str | None = None,
         now: float,
     ) -> None:
         models_json = json.dumps(models, ensure_ascii=False, separators=(",", ":"))
@@ -130,14 +132,16 @@ class ModelTraceDB:
                         account_id, name, platform, type, schedulable, models_json,
                         last_real_request_at, last_real_model, real_requests_10m,
                         mode, interval_seconds, next_run_at, last_model_index,
-                        cluster_id, cluster_name, real_models_json, paused_models_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                        cluster_id, cluster_name, real_models_json, paused_models_json,
+                        inactive_reason, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         account_id, name, platform, type_, 1 if schedulable else 0,
                         models_json, last_real_request_at, last_real_model,
                         real_requests_10m, mode, interval_seconds, next_run_at,
-                        cluster_id, cluster_name, real_models_json, pms_json, now,
+                        cluster_id, cluster_name, real_models_json, pms_json,
+                        inactive_reason, now,
                     ),
                 )
             else:
@@ -152,7 +156,7 @@ class ModelTraceDB:
                         models_json = ?, last_real_request_at = ?, last_real_model = ?,
                         real_requests_10m = ?, mode = ?, interval_seconds = ?,
                         cluster_id = ?, cluster_name = ?, real_models_json = ?,
-                        paused_models_json = ?,
+                        paused_models_json = ?, inactive_reason = ?,
                         updated_at = ?
                     WHERE account_id = ?
                     """,
@@ -161,7 +165,7 @@ class ModelTraceDB:
                         models_json, last_real_request_at, last_real_model,
                         real_requests_10m, mode, interval_seconds,
                         cluster_id, cluster_name, real_models_json,
-                        pms_json,
+                        pms_json, inactive_reason,
                         now, account_id,
                     ),
                 )
@@ -171,7 +175,8 @@ class ModelTraceDB:
             self._conn.execute(
                 """
                 UPDATE accounts
-                SET schedulable = 0, mode = 'retired', next_run_at = NULL, updated_at = ?
+                SET schedulable = 0, mode = 'retired', next_run_at = NULL,
+                    inactive_reason = 'removed', updated_at = ?
                 WHERE account_id = ?
                 """,
                 (now, account_id),
@@ -198,13 +203,77 @@ class ModelTraceDB:
                 (index, now, account_id),
             )
 
-    def has_pending_account(self, account_id: int) -> bool:
+    @contextmanager
+    def account_sync_transaction(self, *, timeout_seconds: float | None = None):
+        """Publish a complete host revision without waiting past the GET budget."""
+        deadline = None if timeout_seconds is None else time.monotonic() + max(0.0, timeout_seconds)
+        acquired = (self._lock.acquire() if deadline is None
+                    else self._lock.acquire(timeout=max(0.0, deadline - time.monotonic())))
+        if not acquired:
+            raise TimeoutError("account sync connection lock")
+        old_busy_timeout = None
+        try:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("account sync database deadline")
+                old_busy_timeout = int(self._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+                self._conn.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+        finally:
+            if old_busy_timeout is not None:
+                self._conn.execute(f"PRAGMA busy_timeout={old_busy_timeout}")
+            self._lock.release()
+
+    @contextmanager
+    def read_snapshot(self):
+        """Read one committed WAL view, including writes from other workers.
+
+        The lock only protects this connection. An explicit read transaction
+        also keeps successive SELECTs on the same database revision while a
+        different connection commits. Nested projections reuse the outer view
+        and must not commit or roll back a transaction they do not own.
+        """
         with self._lock:
-            row = self._conn.execute(
-                "SELECT 1 FROM account_queue WHERE account_id = ? AND state IN ('queued', 'running')",
-                (account_id,),
+            owns_transaction = not self._conn.in_transaction
+            if owns_transaction:
+                self._conn.execute("BEGIN")
+            try:
+                if owns_transaction:
+                    # BEGIN is deferred; force the WAL view to be pinned now.
+                    self._conn.execute("SELECT rootpage FROM sqlite_master LIMIT 1").fetchone()
+                yield
+            finally:
+                if owns_transaction:
+                    self._conn.execute("ROLLBACK")
+
+    def get_pending_account_job(self, account_id: int, *, cluster_id: str | None = None) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT q.* FROM account_queue q LEFT JOIN accounts a ON a.account_id = q.account_id "
+                "WHERE q.state IN ('queued', 'running') "
+                "AND (q.account_id = ? OR (? IS NOT NULL AND a.cluster_id = ?)) "
+                "ORDER BY CASE q.state WHEN 'running' THEN 0 ELSE 1 END, q.id LIMIT 1",
+                (account_id, cluster_id, cluster_id),
             ).fetchone()
-            return row is not None
+
+    def has_pending_account(self, account_id: int, *, cluster_id: str | None = None) -> bool:
+        return self.get_pending_account_job(account_id, cluster_id=cluster_id) is not None
+
+    def cancel_account_job(self, queue_id: int, *, now: float, reason: str) -> None:
+        """Cancel stale work without manufacturing a fingerprint/history row."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE account_queue SET state = 'error', finished_at = ?, error_code = ? "
+                "WHERE id = ? AND state IN ('queued', 'running')",
+                (now, reason, queue_id),
+            )
 
     def is_account_running(self, account_id: int) -> bool:
         with self._lock:
@@ -227,25 +296,34 @@ class ModelTraceDB:
         available_at = now if available_at is None else available_at
         with self._lock:
             try:
+                # One SQLite statement makes target-level admission atomic even
+                # across connections. Retired representatives still own running
+                # jobs, so do not filter their account rows out of this join.
                 cursor = self._conn.execute(
                     """
                     INSERT INTO account_queue (
                         account_id, model, state, trigger, requested_at, available_at, retest_index
-                    ) VALUES (?, ?, 'queued', ?, ?, ?, ?)
+                    ) SELECT ?, ?, 'queued', ?, ?, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM account_queue q
+                        LEFT JOIN accounts a ON a.account_id = q.account_id
+                        WHERE q.state IN ('queued', 'running')
+                          AND (q.account_id = ? OR a.cluster_id = (
+                              SELECT cluster_id FROM accounts WHERE account_id = ?
+                          ))
+                    )
                     """,
-                    (account_id, model, trigger, now, available_at, retest_index),
+                    (account_id, model, trigger, now, available_at, retest_index, account_id, account_id),
                 )
-                return True, int(cursor.lastrowid)
+                if cursor.rowcount:
+                    return True, int(cursor.lastrowid)
             except sqlite3.IntegrityError:
-                existing = self._conn.execute(
-                    """
-                    SELECT id FROM account_queue
-                    WHERE account_id = ? AND state IN ('queued', 'running')
-                    ORDER BY id LIMIT 1
-                    """,
-                    (account_id,),
-                ).fetchone()
-                return False, int(existing["id"]) if existing else None
+                pass
+            account = self.get_account(account_id)
+            existing = self.get_pending_account_job(
+                account_id, cluster_id=account["cluster_id"] if account is not None else None,
+            )
+            return False, int(existing["id"]) if existing is not None else None
 
     def claim_next_account(self, *, now: float, allow_scheduled: bool = True) -> AccountQueueItem | None:
         with self._lock:
@@ -392,31 +470,32 @@ class ModelTraceDB:
                 (account_id,),
             ).fetchone()
 
-    def get_account_rounds(self, account_id: int, *, limit: int = 12) -> list[sqlite3.Row]:
+    def get_account_rounds(
+        self, account_id: int, *, limit: int = 12, model: str | None = None,
+    ) -> list[sqlite3.Row]:
         with self._lock:
-            rows = self._conn.execute(
+            return self._conn.execute(
                 """
-                SELECT * FROM (
-                    SELECT * FROM account_rounds WHERE account_id = ?
-                    ORDER BY checked_at DESC, id DESC LIMIT ?
-                ) ORDER BY checked_at DESC, id DESC
+                SELECT * FROM account_rounds
+                WHERE account_id = ? AND (? IS NULL OR model = ?)
+                ORDER BY checked_at DESC, id DESC LIMIT ?
                 """,
-                (account_id, limit),
+                (account_id, model, model, limit),
             ).fetchall()
-            return rows
 
     def get_latest_rounds_for_all_accounts(self, model: str | None = None) -> dict[int, sqlite3.Row]:
-        """Latest round per account; with ``model``, the latest round for that model."""
+        """Latest checked round per account, matching the detail view's order."""
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT ar.* FROM account_rounds ar
                 INNER JOIN (
-                    SELECT account_id, MAX(id) as max_id
+                    SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY account_id ORDER BY checked_at DESC, id DESC
+                    ) AS position
                     FROM account_rounds
                     WHERE ? IS NULL OR model = ?
-                    GROUP BY account_id
-                ) latest ON ar.id = latest.max_id
+                ) latest ON ar.id = latest.id AND latest.position = 1
                 """,
                 (model, model),
             ).fetchall()
@@ -725,6 +804,7 @@ class ModelTraceDB:
             ("cluster_name", "TEXT"),
             ("real_models_json", "TEXT NOT NULL DEFAULT '[]'"),
             ("paused_models_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("inactive_reason", "TEXT"),
         ):
             if name not in acct_columns:
                 self._conn.execute(f"ALTER TABLE accounts ADD COLUMN {name} {definition}")
@@ -814,6 +894,14 @@ class ModelTraceDB:
                 (monitor_id,),
             ).fetchone()
         return row is not None
+
+    def get_pending_job(self, monitor_id: int) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(
+                "SELECT * FROM queue WHERE monitor_id = ? "
+                "AND state IN ('queued', 'running') ORDER BY id LIMIT 1",
+                (monitor_id,),
+            ).fetchone()
 
     def has_pending(self, monitor_id: int) -> bool:
         with self._lock:

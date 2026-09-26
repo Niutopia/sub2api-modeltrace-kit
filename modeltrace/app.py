@@ -9,6 +9,7 @@ from flask import Flask, jsonify, request
 from modeltrace.config import ConfigError, load_config
 from modeltrace.service import (
     DuplicateQueue,
+    NotParticipating,
     ExpectedModelMismatch,
     ModelNotSupported,
     ModelTraceService,
@@ -95,13 +96,13 @@ def create_app(
     @app.get("/accounts")
     @app.get("/v1/accounts")
     def list_accounts() -> Any:
-        return jsonify(modeltrace.all_accounts_snapshot())
+        return jsonify(modeltrace.all_accounts_snapshot(force_refresh=True))
 
     @app.get("/accounts/<int:account_id>")
     @app.get("/v1/accounts/<int:account_id>")
     def get_account_detail(account_id: int) -> Any:
         try:
-            return jsonify(modeltrace.account_snapshot(account_id))
+            return jsonify(modeltrace.account_snapshot(account_id, force_refresh=True))
         except UnknownAccount:
             return jsonify({"error": "not_found"}), 404
 
@@ -123,12 +124,14 @@ def create_app(
         payload = request.get_json(silent=True) or {}
         model_req = payload.get("model") if isinstance(payload, dict) else None
         try:
-            result = modeltrace.enqueue_manual_account(account_id, model=model_req)
+            result = modeltrace.enqueue_manual_account(account_id, model=model_req, force_refresh=True)
             return jsonify({"queued": result.queued, "model": result.model}), 202
         except UnknownAccount:
             return jsonify({"error": "not_found"}), 404
         except ModelNotSupported:
             return jsonify({"error": "model_not_supported"}), 400
+        except NotParticipating:
+            return jsonify({"error": "not_participating", "queued": False, "message_code": "not_participating"}), 409
         except DuplicateQueue:
             return jsonify({"error": "already_queued", "queued": False, "message_code": "duplicate"}), 409
 

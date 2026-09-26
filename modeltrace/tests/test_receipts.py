@@ -119,6 +119,8 @@ def test_public_snapshot_and_persisted_rounds_exclude_secrets_and_raw_output(tmp
         "enabled", "supported", "running", "interval_seconds", "last_checked_at", "next_run_at",
         "stale", "latest", "history", "paused_budget", "next_run_after", "paused_reconciliation",
         "retest_progress", "accounts_summary",
+        "queued", "schedule_mode", "snapshot_at",
+        "queued_at", "available_at", "started_at",
     }
     if public["retest_progress"] is not None:
         assert set(public["retest_progress"]) == {"done", "total"}
