@@ -82,7 +82,7 @@ def test_disabled_queue_claim_leaves_scheduled_job_untouched(tmp_path,fake_clock
     assert svc.db.claim_next_account(now=fake_clock(),allow_scheduled=True).trigger=='scheduled'
 
 def test_configured_route_alias_uses_canonical_calibration(tmp_path,fake_clock,monkeypatch):
-    alias=MODEL+'-basispoints'
+    alias=MODEL+'-routed'
     svc,host,transport=make(tmp_path,fake_clock,model=alias,overrides={'model_aliases':{alias:MODEL}})
     assert alias in host.fetch_calls[-1]
     assert json.loads(svc.db.get_account(38)['models_json'])==[alias]
@@ -95,7 +95,7 @@ def test_configured_route_alias_uses_canonical_calibration(tmp_path,fake_clock,m
     assert host.pause_calls==[]
 
 def test_transport_accepts_only_declared_alias_and_preserves_request_name():
-    alias=MODEL+'-basispoints';t=ProbeTransport(endpoint='https://mock.invalid',api_key='mock',model_aliases={alias:MODEL})
+    alias=MODEL+'-routed';t=ProbeTransport(endpoint='https://mock.invalid',api_key='mock',model_aliases={alias:MODEL})
     payload=t._payload(alias,{'prompt':'text-only'})
     assert payload['model']==alias and payload['reasoning']['effort']=='low'
     obs=SimpleNamespace(expected_model=alias,upstream_model=None)

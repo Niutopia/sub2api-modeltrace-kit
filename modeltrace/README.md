@@ -1,4 +1,4 @@
-# ModelTrace 检测服务（sub2api 集成版，0.1.19）
+# ModelTrace 检测服务（sub2api 集成版，0.1.20）
 
 判断“上游号实际跑的是不是它声称的模型”。以独立容器跑在 sub2api 旁边，只通过 Docker 内网与 sub2api 通信。部署步骤见上一级 [README](../README.md)。
 

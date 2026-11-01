@@ -292,6 +292,7 @@ class ModelTraceDB:
         available_at: float | None = None,
         trigger: str = "scheduled",
         retest_index: int = 0,
+        promote_scheduled: bool = False,
     ) -> tuple[bool, int | None]:
         available_at = now if available_at is None else available_at
         with self._lock:
@@ -323,6 +324,16 @@ class ModelTraceDB:
             existing = self.get_pending_account_job(
                 account_id, cluster_id=account["cluster_id"] if account is not None else None,
             )
+            if (promote_scheduled and trigger == "manual" and existing is not None
+                    and existing["state"] == "queued" and existing["trigger"] == "scheduled"):
+                promoted = self._conn.execute(
+                    "UPDATE account_queue SET account_id=?, model=?, trigger='manual', "
+                    "requested_at=?, available_at=?, retest_index=0 "
+                    "WHERE id=? AND state='queued' AND trigger='scheduled'",
+                    (account_id, model, now, available_at, int(existing["id"])),
+                )
+                if promoted.rowcount == 1:
+                    return True, int(existing["id"])
             return False, int(existing["id"]) if existing is not None else None
 
     def claim_next_account(self, *, now: float, allow_scheduled: bool = True) -> AccountQueueItem | None:
@@ -983,6 +994,19 @@ class ModelTraceDB:
                 self._conn.execute("ROLLBACK")
                 raise
         return created
+
+    def expire_scheduled_monitor_continuation(
+        self, monitor_id: int, *, now: float, max_idle_seconds: float,
+    ) -> bool:
+        """Discard only unstarted automatic continuations after a long idle."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE queue SET state='error', finished_at=?, error_code='stale_continuation' "
+                "WHERE monitor_id=? AND state='queued' AND trigger='auto_retest' "
+                "AND retest_index>0 AND available_at<=?",
+                (now, monitor_id, now - max_idle_seconds),
+            )
+            return cursor.rowcount > 0
 
     def claim_next(self, *, now: float, allow_scheduled: bool = True) -> QueueItem | None:
         with self._lock:
@@ -2095,6 +2119,7 @@ class ModelTraceDB:
         receipt_consistent: bool | None,
         actual_cost_usd: float | None,
         reserved_usd: float | None,
+        continuation_retest_index: int | None = None,
     ) -> int:
         ranking_json = json.dumps(ranking, ensure_ascii=False, separators=(",", ":"))
         diagnostics_json = json.dumps(diagnostics, ensure_ascii=False, separators=(",", ":"))
@@ -2157,6 +2182,20 @@ class ModelTraceDB:
                         job.monitor_id,
                     ),
                 )
+                if continuation_retest_index is not None:
+                    # Release the one-pending unique slot and install its successor
+                    # in the SAME transaction. A repeated completion cannot enqueue twice.
+                    # A continuation belongs to the request that started the
+                    # batch. Manual batches must remain runnable when automatic
+                    # scheduling is disabled; scheduled batches must not gain
+                    # manual privileges. Recovery still cancels retest_index>0
+                    # because the classifier's in-memory batch state is gone.
+                    continuation_trigger = "manual" if job.trigger == "manual" else "auto_retest"
+                    self._conn.execute(
+                        "INSERT INTO queue(monitor_id, state, trigger, requested_at, available_at, retest_index) "
+                        "VALUES (?, 'queued', ?, ?, ?, ?)",
+                        (job.monitor_id, continuation_trigger, checked_at, checked_at, continuation_retest_index),
+                    )
                 self._conn.execute("COMMIT")
             except Exception:
                 self._conn.execute("ROLLBACK")

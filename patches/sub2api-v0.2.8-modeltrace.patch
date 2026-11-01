@@ -3692,12 +3692,83 @@ index 53bd3d8cc..c9fa68754 100644
  	return context.WithoutCancel(ctx), func() {}
  }
  
+diff --git a/backend/internal/service/model_rate_limit.go b/backend/internal/service/model_rate_limit.go
+index d76bc423f..7ba96da82 100644
+--- a/backend/internal/service/model_rate_limit.go
++++ b/backend/internal/service/model_rate_limit.go
+@@ -67,9 +67,13 @@ func (a *Account) modelRateLimitKeysForRequest(ctx context.Context, requestedMod
+ 		return nil
+ 	}
+ 
+-	modelKey := a.GetMappedModel(requestedModel)
+-	if a.Platform == PlatformAntigravity {
++	var modelKey string
++	if a.Platform == PlatformOpenAI && a.IsOpenAIPassthroughEnabled() {
++		modelKey = requestedModel
++	} else if a.Platform == PlatformAntigravity {
+ 		modelKey = resolveFinalAntigravityModelKey(ctx, a, requestedModel)
++	} else {
++		modelKey = a.GetMappedModel(requestedModel)
+ 	}
+ 	modelKey = strings.TrimSpace(modelKey)
+ 	if modelKey == "" {
+diff --git a/backend/internal/service/model_rate_limit_test.go b/backend/internal/service/model_rate_limit_test.go
+index 430d91baf..03b3feaf3 100644
+--- a/backend/internal/service/model_rate_limit_test.go
++++ b/backend/internal/service/model_rate_limit_test.go
+@@ -543,3 +543,46 @@ func TestIsAnthropicFableModel(t *testing.T) {
+ 	require.False(t, isAnthropicFableModel("claude-sonnet-4-6"))
+ 	require.False(t, isAnthropicFableModel(""))
+ }
++
++func TestIsModelRateLimited_OpenAIPassthroughUsesRequestedModelDirectly(t *testing.T) {
++	future := time.Now().Add(10 * time.Minute).Format(time.RFC3339)
++	account := &Account{
++		Platform: PlatformOpenAI,
++		Extra: map[string]any{
++			"openai_passthrough": true,
++			modelRateLimitsKey: map[string]any{
++				"gpt-6-astra": map[string]any{
++					"rate_limit_reset_at": future,
++				},
++			},
++		},
++		Credentials: map[string]any{
++			"model_mapping": map[string]any{
++				"gpt-6-astra": "gpt-5.6-sol",
++			},
++		},
++	}
++
++	// For passthrough, the rate limit key is the requested model, not the mapped model.
++	require.True(t, account.isModelRateLimitedWithContext(context.Background(), "gpt-6-astra"))
++	require.False(t, account.isModelRateLimitedWithContext(context.Background(), "gpt-5.6-sol"))
++
++	// Non-passthrough account with mapping should use mapped model
++	normalAccount := &Account{
++		Platform: PlatformOpenAI,
++		Extra: map[string]any{
++			modelRateLimitsKey: map[string]any{
++				"gpt-5.6-sol": map[string]any{
++					"rate_limit_reset_at": future,
++				},
++			},
++		},
++		Credentials: map[string]any{
++			"model_mapping": map[string]any{
++				"gpt-6-astra": "gpt-5.6-sol",
++			},
++		},
++	}
++	require.True(t, normalAccount.isModelRateLimitedWithContext(context.Background(), "gpt-6-astra"))
++	require.True(t, normalAccount.isModelRateLimitedWithContext(context.Background(), "gpt-5.6-sol"))
++}
 diff --git a/backend/internal/service/modeltrace_accounts_inactive_test.go b/backend/internal/service/modeltrace_accounts_inactive_test.go
 new file mode 100644
-index 000000000..28e6b8977
+index 000000000..9a4ef7830
 --- /dev/null
 +++ b/backend/internal/service/modeltrace_accounts_inactive_test.go
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,84 @@
 +package service
 +
 +import (
@@ -3721,8 +3792,11 @@ index 000000000..28e6b8977
 +		{"pool", Account{Status: StatusActive, Schedulable: true}, ""},
 +		{"expired windows", Account{Status: StatusActive, Schedulable: true, RateLimitResetAt: &earlier, TempUnschedulableUntil: &earlier}, ""},
 +		{"manual off", Account{Status: StatusActive, Schedulable: false}, "unschedulable"},
++		{"expired", Account{Status: StatusActive, Schedulable: true, AutoPauseOnExpired: true, ExpiresAt: &earlier}, "expired"},
++		{"overloaded", Account{Status: StatusActive, Schedulable: true, OverloadUntil: &later}, "overloaded"},
 +		{"rate limited", Account{Status: StatusActive, Schedulable: true, RateLimitResetAt: &later}, "rate_limited"},
 +		{"temp", Account{Status: StatusActive, Schedulable: true, TempUnschedulableUntil: &later}, "temp_unschedulable"},
++		{"quota exhausted", Account{Status: StatusActive, Schedulable: true, Type: AccountTypeAPIKey, Extra: map[string]any{"quota_limit": 10.0, "quota_used": 10.0}}, "quota_exhausted"},
 +		{"error", Account{Status: StatusError, Schedulable: true}, "error"},
 +		{"disabled", Account{Status: "disabled", Schedulable: true}, "disabled"},
 +	}
@@ -4101,10 +4175,10 @@ index 000000000..44499438d
 +}
 diff --git a/backend/internal/service/modeltrace_accounts_service.go b/backend/internal/service/modeltrace_accounts_service.go
 new file mode 100644
-index 000000000..465503672
+index 000000000..7ed049a8e
 --- /dev/null
 +++ b/backend/internal/service/modeltrace_accounts_service.go
-@@ -0,0 +1,527 @@
+@@ -0,0 +1,551 @@
 +package service
 +
 +import (
@@ -4243,10 +4317,16 @@ index 000000000..465503672
 +		return "disabled"
 +	case !acc.Schedulable:
 +		return "unschedulable"
++	case acc.AutoPauseOnExpired && acc.ExpiresAt != nil && !now.Before(*acc.ExpiresAt):
++		return "expired"
++	case acc.OverloadUntil != nil && now.Before(*acc.OverloadUntil):
++		return "overloaded"
 +	case acc.RateLimitResetAt != nil && now.Before(*acc.RateLimitResetAt):
 +		return "rate_limited"
 +	case acc.TempUnschedulableUntil != nil && now.Before(*acc.TempUnschedulableUntil):
 +		return "temp_unschedulable"
++	case acc.IsAPIKeyOrBedrock() && acc.IsQuotaExceeded():
++		return "quota_exhausted"
 +	}
 +	return ""
 +}
@@ -4335,7 +4415,7 @@ index 000000000..465503672
 +			Name:           acc.Name,
 +			Platform:       acc.Platform,
 +			Type:           acc.Type,
-+			Schedulable:    acc.Schedulable && inactiveReason == "",
++			Schedulable:    acc.IsSchedulable() && inactiveReason == "",
 +			InactiveReason: inactiveReason,
 +			Models:         item.models,
 +			PausedModels:   pausedModels,
@@ -4536,10 +4616,18 @@ index 000000000..465503672
 +// asked for: limits are stored per mapped model (scope), which may differ.
 +func modelTracePausedByRequestedModel(acc *Account, requested []string, paused []ModelTracePausedModel) []ModelTracePausedModel {
 +	out := make([]ModelTracePausedModel, 0, len(paused))
++	isPassthrough := acc.IsOpenAIPassthroughEnabled()
 +	for _, p := range paused {
 +		matched := false
 +		for _, m := range requested {
-+			if strings.TrimSpace(acc.GetMappedModel(m)) == p.Model {
++			expectedScope := strings.TrimSpace(m)
++			if !isPassthrough {
++				expectedScope = strings.TrimSpace(acc.GetMappedModel(m))
++				if expectedScope == "" {
++					expectedScope = strings.TrimSpace(m)
++				}
++			}
++			if expectedScope == p.Model {
 +				out = append(out, ModelTracePausedModel{Model: m, Until: p.Until})
 +				matched = true
 +			}
@@ -4567,9 +4655,14 @@ index 000000000..465503672
 +		return nil, ErrAccountNotFound
 +	}
 +
-+	scope := strings.TrimSpace(acc.GetMappedModel(model))
-+	if scope == "" {
++	var scope string
++	if acc.IsOpenAIPassthroughEnabled() {
 +		scope = strings.TrimSpace(model)
++	} else {
++		scope = strings.TrimSpace(acc.GetMappedModel(model))
++		if scope == "" {
++			scope = strings.TrimSpace(model)
++		}
 +	}
 +
 +	now := time.Now().UTC()
@@ -4615,9 +4708,14 @@ index 000000000..465503672
 +		return nil, ErrAccountNotFound
 +	}
 +
-+	scope := strings.TrimSpace(acc.GetMappedModel(model))
-+	if scope == "" {
++	var scope string
++	if acc.IsOpenAIPassthroughEnabled() {
 +		scope = strings.TrimSpace(model)
++	} else {
++		scope = strings.TrimSpace(acc.GetMappedModel(model))
++		if scope == "" {
++			scope = strings.TrimSpace(model)
++		}
 +	}
 +
 +	clearer, ok := s.accountRepo.(modelRateLimitScopeClearer)
@@ -4867,6 +4965,124 @@ index 000000000..376e18fe0
 +		{Model: "gpt-6-astra", Until: "2026-09-25T01:00:00Z"},
 +		{Model: "unrelated-scope", Until: "2026-09-25T02:00:00Z"},
 +	}, got)
++}
+diff --git a/backend/internal/service/modeltrace_bridge_passthrough_test.go b/backend/internal/service/modeltrace_bridge_passthrough_test.go
+new file mode 100644
+index 000000000..57e57781b
+--- /dev/null
++++ b/backend/internal/service/modeltrace_bridge_passthrough_test.go
+@@ -0,0 +1,112 @@
++package service
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++type modeltraceBridgeTestRepo struct {
++	AccountRepository
++	account *Account
++}
++
++func (r *modeltraceBridgeTestRepo) GetByID(context.Context, int64) (*Account, error) {
++	return r.account, nil
++}
++
++func (r *modeltraceBridgeTestRepo) ListAllWithFilters(context.Context, string, string, string, string, int64, string) ([]Account, error) {
++	return []Account{*r.account}, nil
++}
++
++func (r *modeltraceBridgeTestRepo) SetModelRateLimit(_ context.Context, _ int64, scope string, until time.Time, reason ...string) error {
++	why := ""
++	if len(reason) > 0 {
++		why = reason[0]
++	}
++	setAccountModelRateLimitSnapshot(r.account, scope, until, why, time.Now())
++	return nil
++}
++
++func (r *modeltraceBridgeTestRepo) ClearModelRateLimitScopeIfReason(_ context.Context, _ int64, scope, reason string) (bool, error) {
++	if r.account == nil || r.account.Extra == nil {
++		return false, nil
++	}
++	limits, ok := r.account.Extra[modelRateLimitsKey].(map[string]any)
++	if !ok {
++		return false, nil
++	}
++	entry, ok := limits[scope].(map[string]any)
++	if !ok {
++		return false, nil
++	}
++	if entryReason, _ := entry["reason"].(string); entryReason != reason {
++		return false, nil
++	}
++	delete(limits, scope)
++	return true, nil
++}
++
++func TestModelTraceBridge_DiscoveryRejectMismatch(t *testing.T) {
++	for _, kind := range []string{"expired", "overloaded", "quota_exhausted"} {
++		t.Run(kind, func(t *testing.T) {
++			past, future := time.Now().Add(-time.Hour), time.Now().Add(time.Hour)
++			a := &Account{ID: 17, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Status: StatusActive, Schedulable: true}
++			switch kind {
++			case "expired":
++				a.ExpiresAt = &past
++				a.AutoPauseOnExpired = true
++			case "overloaded":
++				a.OverloadUntil = &future
++			case "quota_exhausted":
++				a.Extra = map[string]any{"quota_limit": 1.0, "quota_used": 1.0}
++			}
++			require.False(t, a.IsSchedulable())
++			r := &modeltraceBridgeTestRepo{account: a}
++			result, err := NewModelTraceAccountsService(r, nil).GetAccounts(context.Background(), []string{"gpt-6-astra"}, true)
++			require.NoError(t, err)
++			require.Len(t, result.Accounts, 1)
++			selection, err := (&OpenAIGatewayService{accountRepo: r}).SelectAccountForModelTraceProbe(context.Background(), a.ID, "gpt-6-astra")
++			require.ErrorIs(t, err, ErrNoAvailableAccounts)
++			require.Nil(t, selection)
++			require.False(t, result.Accounts[0].Schedulable, "discovery must not advertise an account that IsSchedulable rejects")
++			require.Equal(t, kind, result.Accounts[0].InactiveReason)
++		})
++	}
++}
++
++func TestModelTraceBridge_PassthroughPauseScope(t *testing.T) {
++	a := &Account{
++		ID:          17,
++		Platform:    PlatformOpenAI,
++		Type:        AccountTypeAPIKey,
++		Status:      StatusActive,
++		Schedulable: true,
++		Extra:       map[string]any{"openai_passthrough": true},
++		Credentials: map[string]any{
++			"model_mapping": map[string]any{"gpt-6-astra": "gpt-5.6-sol"},
++		},
++	}
++	r := &modeltraceBridgeTestRepo{account: a}
++	svc := NewModelTraceAccountsService(r, nil)
++
++	result, err := svc.PauseModel(context.Background(), a.ID, "gpt-6-astra", 60)
++	require.NoError(t, err)
++	require.True(t, result.Paused)
++
++	require.False(t, a.IsSchedulableForModel("gpt-6-astra"))
++	require.True(t, a.IsSchedulableForModel("gpt-5.6-sol"), "pausing astra must not pause sol when passthrough is enabled")
++
++	accs, err := svc.GetAccounts(context.Background(), []string{"gpt-6-astra", "gpt-5.6-sol"}, false)
++	require.NoError(t, err)
++	require.Len(t, accs.Accounts, 1)
++	require.Len(t, accs.Accounts[0].PausedModels, 1)
++	require.Equal(t, "gpt-6-astra", accs.Accounts[0].PausedModels[0].Model)
++
++	resumeResult, err := svc.ResumeModel(context.Background(), a.ID, "gpt-6-astra")
++	require.NoError(t, err)
++	require.True(t, resumeResult.Resumed)
++	require.True(t, a.IsSchedulableForModel("gpt-6-astra"))
 +}
 diff --git a/backend/internal/service/modeltrace_probe_middleware_test.go b/backend/internal/service/modeltrace_probe_middleware_test.go
 new file mode 100644

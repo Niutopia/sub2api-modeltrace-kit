@@ -389,3 +389,26 @@ def test_internal_snapshot_does_not_overwrite_local_pause_or_fetch_host(service,
     snapshot = service.account_snapshot(42)
     assert snapshot["per_model"][0]["paused_until"] == until
     assert len(service.host_client.calls) == 1
+
+
+def test_removed_model_history_is_retained_but_never_becomes_a_probe_target(service, fake_clock):
+    service.db.insert_account_round(account_id=42, model=ASTRA, status='error',
+        message_code='upstream_error', checked_at=fake_clock())
+    service.enqueue_manual_account(42, model=ASTRA)
+    service.host_client.accounts = [account(models=[LUNA])]
+    service._refresh_accounts(fake_clock())
+    snapshot = service.account_snapshot(42)
+    assert snapshot['models'] == [LUNA]
+    assert [row['model'] for row in snapshot['per_model']] == [LUNA]
+    assert any(row['model'] == ASTRA for row in snapshot['history'])
+    with pytest.raises(ModelNotSupported):
+        service.enqueue_manual_account(42, model=ASTRA)
+    pending = service.db.claim_next_account(now=fake_clock())
+    if pending is not None:
+        assert pending.model == ASTRA
+        service._run_account_job_safely(pending)
+    assert service.transport.calls == []
+    assert service.db.get_pending_account_job(42) is None
+    service._schedule_due_accounts(fake_clock())
+    scheduled = service.db.get_pending_account_job(42)
+    assert scheduled is None or scheduled['model'] == LUNA

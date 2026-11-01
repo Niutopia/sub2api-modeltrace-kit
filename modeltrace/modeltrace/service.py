@@ -449,10 +449,6 @@ class ModelTraceService:
             return
         slot_width = self.config.interval_seconds / len(monitor_ids)
         for monitor_id in monitor_ids:
-            state = self.db.get_state(monitor_id)
-            due_at = state["next_run_at"]
-            if due_at is None or self.db.has_pending(monitor_id):
-                continue
             completion_age = (
                 None
                 if self._last_round_completed_at is None
@@ -462,6 +458,14 @@ class ModelTraceService:
                 completion_age is not None
                 and 0 <= completion_age <= self.config.interval_seconds
             )
+            if not live_worker_continuity and self.db.expire_scheduled_monitor_continuation(
+                monitor_id, now=now, max_idle_seconds=self.config.interval_seconds,
+            ):
+                self._retest_states.pop(monitor_id, None)
+            state = self.db.get_state(monitor_id)
+            due_at = state["next_run_at"]
+            if due_at is None or self.db.has_pending(monitor_id):
+                continue
             if (
                 not live_worker_continuity
                 and now - float(due_at) >= slot_width
@@ -693,6 +697,8 @@ class ModelTraceService:
         sample_class = classify_sample(analysis, self.config.calibration_model_for(monitor.model), previous=previous_samples)
         outcome = sample_class["outcome"]
 
+        continuation_retest_index = None
+
         # Check if currently in retest state
         retest_state = self._retest_states.get(monitor.monitor_id)
         if retest_state is None:
@@ -715,7 +721,7 @@ class ModelTraceService:
                 message_code = outcome
                 # Enqueue immediately for next worker turn!
                 next_run = finish
-                self.db.enqueue(monitor.monitor_id, now=finish, available_at=finish, trigger="auto_retest", retest_index=1)
+                continuation_retest_index = 1
         else:
             # This is a retest probe!
             retest_state["done"] += 1
@@ -743,7 +749,7 @@ class ModelTraceService:
                 status = "uncertain"
                 message_code = outcome
                 next_run = finish
-                self.db.enqueue(monitor.monitor_id, now=finish, available_at=finish, trigger="auto_retest", retest_index=retest_state["done"])
+                continuation_retest_index = retest_state["done"] + 1
 
         retest_prog = None
         if monitor.monitor_id in self._retest_states:
@@ -782,6 +788,7 @@ class ModelTraceService:
             receipt_consistent=None,
             actual_cost_usd=None,
             reserved_usd=None,
+            continuation_retest_index=continuation_retest_index,
         )
     def _other_model_streak(self, monitor_id: int, winner: str) -> int:
         rows = self.db.get_rounds(monitor_id, limit=HISTORY_LIMIT)
@@ -1879,6 +1886,8 @@ class ModelTraceService:
             self.db.cancel_account_job(job.queue_id, now=self.clock(), reason="account_or_model_unavailable")
             return
         rep_account_id = target["rep_account_id"]
+        initial_cluster_id = target.get("cluster_id")
+        initial_member_ids = set(target.get("member_account_ids", []))
 
         # Find eligible members supporting this model and schedulable
         eligible_members: list[sqlite3.Row] = []
@@ -2081,12 +2090,23 @@ class ModelTraceService:
         finish = self.clock()
         original_mode = str(target["mode"])
         original_interval = int(target["interval_seconds"])
-        # A force refresh may change the representative while HTTP is in flight.
-        # Publish completion to the current target, not the queue's former key.
-        current_target, current_members = self._get_target_and_members(job.account_id)
+        # Refresh ONLY the sampled lineage. A representative moved to another
+        # cluster cannot carry old evidence or a completion schedule into it.
+        current_target = next((candidate for candidate in self._get_all_targets()
+            if ((initial_cluster_id is not None and candidate["cluster_id"] == initial_cluster_id)
+                or (initial_cluster_id is None and candidate["cluster_id"] is None
+                    and candidate["rep_account_id"] == job.account_id))), None)
+        lineage_current = False
         if current_target is not None:
-            target, members = current_target, current_members
-            rep_account_id = target["rep_account_id"]
+            current_members = [m for m in current_target["members"]
+                               if int(m["account_id"]) in initial_member_ids]
+            if current_members:
+                target = dict(current_target)
+                members = current_members
+                rep_account_id = int(self._representative(members)["account_id"])
+                target.update(rep_account_id=rep_account_id, members=members,
+                              member_account_ids=[int(m["account_id"]) for m in members])
+                lineage_current = True
         mode = str(target["mode"])
         interval = int(target["interval_seconds"])
         regular_next_run = (finish + interval) if mode == "active" else self._compute_idle_next_run(rep_account_id, finish)
@@ -2125,6 +2145,9 @@ class ModelTraceService:
         if is_apikey and (final_status == "suspect" or self._has_paused_models(target, finish)):
             next_run = min(regular_next_run, finish + getattr(self.config, "paused_recheck_seconds_apikey", 1800))
 
+        if not lineage_current:
+            next_run = None
+
         exec_job = replace(job, account_id=final_account_id)
         self.db.record_account_round_and_finish(
             exec_job,
@@ -2149,15 +2172,16 @@ class ModelTraceService:
             next_run_at=next_run,
         )
 
-        self._handle_auto_pause_resume(
-            target=target,
-            members=members,
-            model=model,
-            status=final_status,
-            message_code=final_message_code,
-            best_model=final_best_model,
-            now=finish,
-        )
+        if lineage_current:
+            self._handle_auto_pause_resume(
+                target=target,
+                members=members,
+                model=model,
+                status=final_status,
+                message_code=final_message_code,
+                best_model=final_best_model,
+                now=finish,
+            )
 
     def _enqueue_model_on_all_accounts(self, model: str, *, now: float) -> int:
         """Queue one check of ``model`` on every current target that serves it."""
@@ -2228,8 +2252,6 @@ class ModelTraceService:
             # run would only overwrite the last real result with an error.
             raise NotParticipating(account_id)
         rep_id = target["rep_account_id"]
-        if self.db.has_pending_account(rep_id, cluster_id=target["cluster_id"]):
-            raise DuplicateQueue(account_id)
 
         target_models = target["models"]
         if model is not None:
@@ -2248,6 +2270,7 @@ class ModelTraceService:
             available_at=now,
             trigger="manual",
             retest_index=0,
+            promote_scheduled=not self.config.enabled,
         )
         if not queued:
             raise DuplicateQueue(account_id)
